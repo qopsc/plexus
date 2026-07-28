@@ -296,7 +296,9 @@ describe('Dispatcher Failover', () => {
       throw new Error('expected dispatch to fail');
     } catch (error: any) {
       expect(error.message).toContain('All targets failed');
-      expect(error.message).toContain('p1/model-1, p2/model-2');
+      // T6: the client-visible message now carries each attempt's own HTTP
+      // status code (500 from p1, 503 from p2) instead of a bare provider list.
+      expect(error.message).toContain('p1/model-1 (500), p2/model-2 (503)');
       expect(error.routingContext?.attemptCount).toBe(2);
     }
   });

@@ -17,6 +17,7 @@ import {
   MAX_THINKING_SIGNATURE_STRIP_RETRIES,
   MAX_UNSUPPORTED_PARAM_STRIP_RETRIES,
 } from './dispatcher-auto-compat';
+import { EMPTY_COMPLETION_REASON, isEmptyUnifiedResponse } from './empty-completion';
 
 export type StandardAttemptResult =
   | { outcome: 'success'; response: UnifiedChatResponse }
@@ -486,6 +487,62 @@ export async function executeStandardAttempt(
     bypassTransformation,
     adapters
   );
+
+  // T5: empty-completion failover (see empty-completion.ts). An upstream 200
+  // whose transformed completion has zero visible output (no text, tool
+  // calls, reasoning, images, or citations) reads as a hard error to clients
+  // like LobeHub (`ModelEmptyCompletion`) / KiloCode. Treat it as a
+  // retryable target failure so normal failover proceeds to the next
+  // candidate — UNLESS this is the last target, in which case the empty
+  // response is returned as-is: an empty 200 from every candidate is still a
+  // valid upstream answer, so failover-exhaustion semantics must stay
+  // unchanged (no conversion into a 5xx).
+  //
+  // `clientError` is excluded on purpose: some transformers (e.g. Gemini's
+  // MALFORMED_FUNCTION_CALL — transformGeminiResponse) deliberately populate
+  // a clientError-carrying response with no visible output — a distinct,
+  // pre-existing "signal the client directly, no failover, no cooldown"
+  // mechanism handled later in response-handler.ts (see its
+  // `!unifiedResponse.stream && unifiedResponse.clientError` branch). Letting
+  // empty-completion failover fire here would silently discard that specific
+  // diagnostic and introduce retries where they were deliberately excluded,
+  // so any clientError takes precedence and is never treated as empty.
+  const canRetryEmptyCompletion =
+    failoverEnabled &&
+    hasNextTarget &&
+    !nonStreamingResponse.clientError &&
+    isEmptyUnifiedResponse(nonStreamingResponse);
+  if (canRetryEmptyCompletion) {
+    attemptTimeout.cleanup();
+    doRelease();
+    await host.recordAttemptMetric(route, currentRequest.requestId, false, {
+      isVisionFallthrough: (currentRequest as any)._hasVisionFallthrough,
+      isDescriptorRequest: (currentRequest as any)._isVisionDescriptorRequest,
+      visionFallthroughModel: (currentRequest as any)._visionFallthroughModel,
+    });
+    const emptyCompletionError = new Error(EMPTY_COMPLETION_REASON) as any;
+    emptyCompletionError.routingContext = {
+      provider: route.provider,
+      targetModel: route.model,
+      targetApiType,
+      statusCode: 200,
+      // Not a provider-health issue — the HTTP call itself succeeded, it
+      // just carried no visible output — so cooldown must be skipped here,
+      // mirroring how caller-errors (400 non-quota, 413, 422) skip
+      // CooldownManager.markProviderFailure above.
+      cooldownTriggered: false,
+    };
+    host.appendFailureAttempt(retryHistory, route, emptyCompletionError, targetApiType, true);
+    host.saveIntermediateError(
+      currentRequest.requestId,
+      targetApiType || 'chat',
+      emptyCompletionError
+    );
+    logger.warn(
+      `Failover: retrying after empty completion (no visible output) from ${route.provider}/${route.model}`
+    );
+    return { outcome: 'retry', error: emptyCompletionError };
+  }
 
   await host.recordAttemptMetric(route, currentRequest.requestId, true, {
     isVisionFallthrough: (currentRequest as any)._hasVisionFallthrough,
