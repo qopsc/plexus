@@ -70,23 +70,52 @@ function hasVisibleText(value: string | null | undefined): boolean {
  * (rather than `UnifiedChatResponse` verbatim) so forward-compatible fields
  * not yet on the unified type — e.g. a future `images` array for multimodal
  * chat output — are picked up defensively without requiring a type change
- * here. No current transformer populates the `images` array, so the
- * `images`-array contribution is exercised directly by the unit tests rather
- * than via a real transformer fixture.
+ * here. No current transformer populates the `images` array (Responses image
+ * output travels on the typed `image_generation_calls` carry — see
+ * countTypedImageGenerationCalls below), so the `images`-array contribution
+ * is exercised directly by the unit tests rather than via a real transformer
+ * fixture.
  */
 type VisibilityCheckableResponse = Pick<
   UnifiedChatResponse,
-  'content' | 'reasoning_content' | 'thinking' | 'tool_calls' | 'annotations' | 'finishReason'
+  | 'content'
+  | 'reasoning_content'
+  | 'thinking'
+  | 'tool_calls'
+  | 'annotations'
+  | 'finishReason'
+  | 'image_generation_calls'
 > & { images?: unknown[] | null; rawResponse?: unknown };
+
+/**
+ * Counts typed `image_generation_calls` entries with a non-empty base64
+ * `result` on the unified response (see UnifiedImageGenerationCall in
+ * types/unified.ts). This is the PRIMARY image signal on the transformed
+ * (non-bypass) path: unified `content` stays PURE authored text (image
+ * markdown is composed per client format by the renderers, never baked into
+ * content — see transformers/image-rendering.ts), so an image-only
+ * completion has no text and this typed count is what proves the model
+ * produced visible output. Without it, image-only completions would be
+ * misclassified as empty and needlessly failed over.
+ */
+function countTypedImageGenerationCalls(
+  imageGenerationCalls: UnifiedChatResponse['image_generation_calls']
+): number {
+  if (!Array.isArray(imageGenerationCalls)) return 0;
+  return imageGenerationCalls.filter(
+    (imageCall) => typeof imageCall?.result === 'string' && imageCall.result.length > 0
+  ).length;
+}
 
 /**
  * Counts `image_generation_call` built-in-tool-call output items
  * (types/responses.ts `ResponsesBuiltInToolCallItem`) on a raw (pre-transform)
- * Responses API body — the bypass-transformation path (`rawResponse` is
- * populated by dispatcher.ts's `handleNonStreamingResponse`, the ORIGINAL
- * body available at the empty-completion call seam). Result-less items (an
- * `image_generation_call` without a base64 `result`) still count: the model
- * demonstrably produced output.
+ * Responses API body. This raw count covers what the typed carry above
+ * cannot see: the bypass-transformation path (`rawResponse` is populated by
+ * dispatcher.ts's `handleNonStreamingResponse`, the ORIGINAL body available
+ * at the empty-completion call seam) and result-less items (an
+ * `image_generation_call` without a base64 `result` gets no typed carry but
+ * still proves the model produced output).
  */
 function countRawImageGenerationCalls(rawResponse: unknown): number {
   const output = (rawResponse as { output?: unknown })?.output;
@@ -105,6 +134,7 @@ export function getResponseVisibilitySignals(
     toolCallCount: response.tool_calls?.length ?? 0,
     annotationCount: response.annotations?.length ?? 0,
     imageCount:
+      countTypedImageGenerationCalls(response.image_generation_calls) +
       (Array.isArray(response.images) ? response.images.length : 0) +
       countRawImageGenerationCalls(response.rawResponse),
   };

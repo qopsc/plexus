@@ -11,14 +11,35 @@ import {
   ResponsesReasoningTextPart,
   ResponsesSummaryTextPart,
 } from '../types/responses';
-import { UnifiedChatRequest, UnifiedChatResponse, UnifiedMessage } from '../types/unified';
+import {
+  UnifiedChatRequest,
+  UnifiedChatResponse,
+  UnifiedImageGenerationCall,
+  UnifiedMessage,
+} from '../types/unified';
 import { createParser } from 'eventsource-parser';
 import { encode } from 'eventsource-encoder';
 import { logger } from '../utils/logger';
 import { normalizeOpenAIChatUsage, normalizeOpenAIResponsesUsage } from '../utils/usage-normalizer';
+import { imageGenerationCallMarkdown } from './image-rendering';
 
 const OPENAI_RESPONSES_CALL_ID_MAX_LENGTH = 64;
 const OPENAI_RESPONSES_REASONING_CONTENT_MAX_ITEMS = 0;
+
+/**
+ * Projects a completed image_generation_call output item (with a non-empty
+ * base64 `result`) onto the typed unified carry — see
+ * UnifiedImageGenerationCall in types/unified.ts. The `result` is carried
+ * byte-intact: the inline size cap applies only to the chat-format markdown
+ * rendering (see transformers/image-rendering.ts), never to the typed item.
+ */
+function toUnifiedImageGenerationCall(item: any): UnifiedImageGenerationCall {
+  return {
+    ...(typeof item.id === 'string' ? { id: item.id } : {}),
+    ...(typeof item.status === 'string' ? { status: item.status } : {}),
+    result: item.result,
+  };
+}
 
 // Some Responses clients have been observed replaying tool calls with composite
 // IDs like "call_...|fc_...". OpenAI-compatible providers validate call_id
@@ -392,7 +413,29 @@ export class ResponsesTransformer implements Transformer {
 
       // Find the first message output item for content
       const messageItem = response.output?.find((item: any) => item.type === 'message');
-      const content = messageItem?.content?.map((part: any) => part.text).join('\n') || null;
+      const messageText = messageItem?.content?.map((part: any) => part.text).join('\n') || null;
+
+      // Completed image_generation_call items (non-empty base64 `result`)
+      // are carried TYPED ONLY, byte-intact and never size-capped, on
+      // `image_generation_calls` — see UnifiedImageGenerationCall in
+      // types/unified.ts. The unified `content` stays PURE authored message
+      // text: chat-format client renderers compose their own markdown
+      // projection from the typed items (composeContentWithImageMarkdown in
+      // transformers/image-rendering.ts), and the responses-facing
+      // formatResponse re-emits the native item with NO string surgery on
+      // the text — so authored text that happens to contain the same
+      // characters as a rendered image segment can never be corrupted.
+      const imageGenerationCalls: UnifiedImageGenerationCall[] = [];
+      for (const item of response.output ?? []) {
+        if (
+          item?.type === 'image_generation_call' &&
+          typeof item.result === 'string' &&
+          item.result.length > 0
+        ) {
+          imageGenerationCalls.push(toUnifiedImageGenerationCall(item));
+        }
+      }
+      const content = messageText;
 
       // Collect url_citation annotations from all output_text content parts
       const annotations: any[] = [];
@@ -458,6 +501,9 @@ export class ResponsesTransformer implements Transformer {
         reasoning_content,
         annotations: annotations.length > 0 ? annotations : undefined,
         tool_calls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
+        ...(imageGenerationCalls.length > 0
+          ? { image_generation_calls: imageGenerationCalls }
+          : {}),
         usage,
       };
     } else {
@@ -900,6 +946,24 @@ export class ResponsesTransformer implements Transformer {
       }
     }
 
+    // Re-emit typed image_generation_call items natively (full base64 — the
+    // native format has no inline-markdown size concern). Unified `content`
+    // is PURE authored text (transformResponse never bakes a rendered image
+    // segment into it — see transformers/image-rendering.ts), so the message
+    // text below needs NO string surgery: it reaches the client byte-intact
+    // even when the authored text happens to contain the same characters as
+    // a rendered image segment (markdown or oversized placeholder).
+    const messageText = response.content || '';
+    for (const imageCall of response.image_generation_calls ?? []) {
+      if (typeof imageCall.result !== 'string' || imageCall.result.length === 0) continue;
+      items.push({
+        type: 'image_generation_call',
+        id: imageCall.id ?? this.generateItemId('ig'),
+        status: (imageCall.status as 'in_progress' | 'completed' | 'failed') ?? 'completed',
+        result: imageCall.result,
+      });
+    }
+
     // Add main message
     items.push({
       type: 'message',
@@ -909,7 +973,7 @@ export class ResponsesTransformer implements Transformer {
       content: [
         {
           type: 'output_text',
-          text: response.content || '',
+          text: messageText,
           annotations: response.annotations || [],
         },
       ],
@@ -978,7 +1042,10 @@ export class ResponsesTransformer implements Transformer {
     const toolCallIndexByItemId = new Map<string, number>();
     let nextToolCallIndex = 0;
     let hasFunctionCall = false;
-
+    // image_generation_call items already rendered as a content delta from
+    // their response.output_item.done event, so the response.completed
+    // fallback below doesn't render them a second time.
+    const renderedImageItemIds = new Set<string>();
     const getToolCallIndex = (data: any): number => {
       const outputIndex =
         typeof data.output_index === 'number' ? (data.output_index as number) : undefined;
@@ -1085,6 +1152,38 @@ export class ResponsesTransformer implements Transformer {
                   },
                   finish_reason: null,
                 });
+              } else if (
+                data.type === 'response.output_item.done' &&
+                data.item?.type === 'image_generation_call'
+              ) {
+                // Minimal image rendering, COMPLETED items only: a finished
+                // image_generation_call with a base64 result becomes a
+                // markdown data-URI content delta for chat-format clients,
+                // PAIRED with the chunk-level typed carry
+                // (`image_generation_calls`, full base64 — see
+                // types/unified.ts) that responses-facing formatters re-emit
+                // natively instead of the markdown. Partial-image preview
+                // events (response.image_generation_call.partial_image) are
+                // deliberately NOT handled — rendering progressive previews
+                // as chat content deltas has no sensible mapping, so they
+                // are explicitly skipped as out of scope; only the final
+                // completed image renders.
+                const imageMarkdown = imageGenerationCallMarkdown(data.item);
+                if (imageMarkdown) {
+                  if (typeof data.item.id === 'string') {
+                    renderedImageItemIds.add(data.item.id);
+                  }
+                  controller.enqueue({
+                    id: responseId,
+                    model: responseModel,
+                    created: Math.floor(Date.now() / 1000),
+                    delta: {
+                      content: imageMarkdown,
+                    },
+                    image_generation_calls: [toUnifiedImageGenerationCall(data.item)],
+                    finish_reason: null,
+                  });
+                }
               } else if (data.type === 'response.completed') {
                 // Final chunk with usage data and an OpenAI-compatible finish reason.
                 // `response.completed` includes the full output as a fallback because some
@@ -1094,6 +1193,28 @@ export class ResponsesTransformer implements Transformer {
                 const completedResponseHasFunctionCall = data.response?.output?.some(
                   (item: any) => item?.type === 'function_call'
                 );
+                // Same fallback as function calls above: render any completed
+                // image_generation_call items that only appear in the final
+                // response (skipping ones already rendered from their own
+                // response.output_item.done event) BEFORE the terminal chunk,
+                // so the content delta still reaches the client — with the
+                // same paired typed carry as the output_item.done path.
+                for (const item of data.response?.output ?? []) {
+                  if (item?.type !== 'image_generation_call') continue;
+                  if (typeof item.id === 'string' && renderedImageItemIds.has(item.id)) continue;
+                  const imageMarkdown = imageGenerationCallMarkdown(item);
+                  if (!imageMarkdown) continue;
+                  controller.enqueue({
+                    id: responseId,
+                    model: responseModel,
+                    created: Math.floor(Date.now() / 1000),
+                    delta: {
+                      content: imageMarkdown,
+                    },
+                    image_generation_calls: [toUnifiedImageGenerationCall(item)],
+                    finish_reason: null,
+                  });
+                }
                 controller.enqueue({
                   id: responseId,
                   model: responseModel,
@@ -1421,6 +1542,38 @@ export class ResponsesTransformer implements Transformer {
       });
     };
 
+    // Re-emits typed image_generation_call carries (see types/unified.ts) as
+    // native Responses output items — full base64 `result`, no inline size
+    // cap (the markdown guard exists for content strings; the native format
+    // has no such concern). Each item is registered in outputItemsByIndex so
+    // the terminal response.completed's output array includes it.
+    const emitImageGenerationCallItems = (
+      controller: ReadableStreamDefaultController,
+      imageCalls: Array<{ id?: string; status?: string; result: string }>
+    ) => {
+      for (const imageCall of imageCalls) {
+        const outputIndex = reserveOutputIndex();
+        const itemId = imageCall.id || this.generateItemId('ig');
+        const doneItem = {
+          id: itemId,
+          type: 'image_generation_call',
+          status: imageCall.status || 'completed',
+          result: imageCall.result,
+        };
+        sendEvent(controller, {
+          type: 'response.output_item.added',
+          output_index: outputIndex,
+          item: { ...doneItem, status: 'in_progress', result: null },
+        });
+        sendEvent(controller, {
+          type: 'response.output_item.done',
+          output_index: outputIndex,
+          item: doneItem,
+        });
+        outputItemsByIndex.set(outputIndex, doneItem);
+      }
+    };
+
     // `itemStatus` is the terminal status stamped on items that were still
     // in progress when the stream ended. The completed and failed paths keep
     // the pre-existing 'completed' stamp; only the response.incomplete path
@@ -1706,6 +1859,22 @@ export class ResponsesTransformer implements Transformer {
             const reasoningSummaryDelta =
               typeof delta.thinking?.content === 'string' ? delta.thinking.content : null;
 
+            // Typed image_generation_call carries re-emit as NATIVE output
+            // items for this Responses-format client. The same chunk's
+            // `delta.content` is the chat-format markdown rendering of these
+            // exact items (transformStream pairs them 1:1), so the content
+            // delta is skipped below — the native item is the only carrier
+            // here (a chat client would render the markdown instead).
+            const typedImageCalls = Array.isArray(unifiedChunk.image_generation_calls)
+              ? unifiedChunk.image_generation_calls.filter(
+                  (imageCall: any) =>
+                    imageCall && typeof imageCall.result === 'string' && imageCall.result.length > 0
+                )
+              : [];
+            if (typedImageCalls.length > 0) {
+              emitImageGenerationCallItems(controller, typedImageCalls);
+            }
+
             if (reasoningDelta && reasoningDelta.length > 0) {
               ensureReasoningItem(controller);
               reasoningText += reasoningDelta;
@@ -1743,7 +1912,11 @@ export class ResponsesTransformer implements Transformer {
               });
             }
 
-            if (typeof delta.content === 'string' && delta.content.length > 0) {
+            if (
+              typeof delta.content === 'string' &&
+              delta.content.length > 0 &&
+              typedImageCalls.length === 0
+            ) {
               ensureMessageItem(controller);
               messageText += delta.content;
               sendEvent(controller, {

@@ -363,6 +363,924 @@ describe('ResponsesTransformer stream transformation - error handling', () => {
   });
 });
 
+// Tiny fake base64 payload — content is irrelevant, only the data-URI
+// plumbing matters.
+const TINY_IMAGE_B64 = 'aGVsbG8=';
+const TINY_IMAGE_MARKDOWN = `![generated image](data:image/png;base64,${TINY_IMAGE_B64})`;
+
+describe('ResponsesTransformer image_generation_call rendering (pure unified content + chat composition)', () => {
+  // The chat-visible text for a unified response, exactly as a CHAT-format
+  // client receives it: OpenAITransformer.formatResponse composes the
+  // authored text + rendered image markdown from the typed carry
+  // (transformers/image-rendering.ts). The expected strings in this describe
+  // are the pre-split baked-content bytes — chat clients must keep receiving
+  // them byte-identically.
+  const chatVisibleContent = async (unified: any): Promise<string | null> => {
+    const chat = await new OpenAITransformer().formatResponse(unified);
+    return chat.choices[0].message.content;
+  };
+
+  test('an image_generation_call with a base64 result renders markdown data-URI content for chat clients', async () => {
+    const unified = await new ResponsesTransformer().transformResponse({
+      id: 'resp_img',
+      object: 'response',
+      model: 'gpt-image-model',
+      created_at: 1234567890,
+      status: 'completed',
+      output: [
+        { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: TINY_IMAGE_B64 },
+      ],
+      usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 },
+    });
+
+    // Unified content stays PURE — no message item, no text. The image
+    // travels typed; the markdown exists only in the chat projection.
+    expect(unified.content).toBeNull();
+    expect(unified.image_generation_calls).toEqual([
+      { id: 'ig_1', status: 'completed', result: TINY_IMAGE_B64 },
+    ]);
+    expect(await chatVisibleContent(unified)).toBe(TINY_IMAGE_MARKDOWN);
+  });
+
+  test('chat composition appends image markdown after the authored message text', async () => {
+    const unified = await new ResponsesTransformer().transformResponse({
+      id: 'resp_img_order',
+      object: 'response',
+      model: 'gpt-image-model',
+      created_at: 1234567890,
+      status: 'completed',
+      output: [
+        {
+          type: 'message',
+          id: 'msg_1',
+          status: 'completed',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Here is your image:' }],
+        },
+        { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: TINY_IMAGE_B64 },
+      ],
+    });
+
+    expect(unified.content).toBe('Here is your image:');
+    expect(await chatVisibleContent(unified)).toBe(`Here is your image:\n${TINY_IMAGE_MARKDOWN}`);
+  });
+
+  // `output_format` is a REQUEST-side image tool field — it is not present
+  // on image_generation_call output items, so the mime subtype is sniffed
+  // from the decoded base64 head's magic bytes instead (PNG/JPEG/WebP/GIF,
+  // defaulting to png).
+  describe('mime subtype sniffing from the base64 signature', () => {
+    const b64 = (bytes: number[]) => Buffer.from(bytes).toString('base64');
+
+    const renderImage = async (result: string) => {
+      const unified = await new ResponsesTransformer().transformResponse({
+        id: 'resp_img_sniff',
+        object: 'response',
+        model: 'gpt-image-model',
+        created_at: 1234567890,
+        status: 'completed',
+        output: [{ type: 'image_generation_call', id: 'ig_1', status: 'completed', result }],
+      });
+      return chatVisibleContent(unified);
+    };
+
+    test('PNG signature (\\x89PNG) renders image/png', async () => {
+      const png = b64([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d]);
+      expect(await renderImage(png)).toBe(`![generated image](data:image/png;base64,${png})`);
+    });
+
+    test('JPEG signature (\\xFF\\xD8) renders image/jpeg', async () => {
+      const jpeg = b64([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01]);
+      expect(await renderImage(jpeg)).toBe(`![generated image](data:image/jpeg;base64,${jpeg})`);
+    });
+
+    test('WebP signature (RIFF....WEBP) renders image/webp', async () => {
+      const webp = b64([
+        0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50, 0x56, 0x50, 0x38,
+        0x20,
+      ]);
+      expect(await renderImage(webp)).toBe(`![generated image](data:image/webp;base64,${webp})`);
+    });
+
+    test('GIF signature (GIF8) renders image/gif', async () => {
+      const gif = b64([0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00]);
+      expect(await renderImage(gif)).toBe(`![generated image](data:image/gif;base64,${gif})`);
+    });
+
+    test('an unrecognized signature defaults to image/png', async () => {
+      // TINY_IMAGE_B64 decodes to "hello" — no known magic bytes.
+      expect(await renderImage(TINY_IMAGE_B64)).toBe(TINY_IMAGE_MARKDOWN);
+    });
+
+    test('a request-style output_format field on the item is IGNORED (not a response field)', async () => {
+      const unified = await new ResponsesTransformer().transformResponse({
+        id: 'resp_img_webp',
+        object: 'response',
+        model: 'gpt-image-model',
+        created_at: 1234567890,
+        status: 'completed',
+        output: [
+          {
+            type: 'image_generation_call',
+            id: 'ig_1',
+            status: 'completed',
+            result: TINY_IMAGE_B64,
+            output_format: 'webp',
+          },
+        ],
+      });
+
+      // The payload's actual bytes ("hello" — no signature) decide: png.
+      expect(await chatVisibleContent(unified)).toBe(TINY_IMAGE_MARKDOWN);
+    });
+
+    test('RIFF head WITHOUT the WEBP tag does not sniff as webp', async () => {
+      const riffOnly = b64([
+        0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x41, 0x56, 0x49, 0x20,
+      ]);
+      expect(await renderImage(riffOnly)).toBe(
+        `![generated image](data:image/png;base64,${riffOnly})`
+      );
+    });
+  });
+
+  test('an image_generation_call without a base64 result contributes nothing', async () => {
+    const unified = await new ResponsesTransformer().transformResponse({
+      id: 'resp_img_noresult',
+      object: 'response',
+      model: 'gpt-image-model',
+      created_at: 1234567890,
+      status: 'completed',
+      output: [{ type: 'image_generation_call', id: 'ig_1', status: 'completed' }],
+    });
+
+    expect(unified.content).toBeNull();
+    expect(unified.image_generation_calls).toBeUndefined();
+    expect(await chatVisibleContent(unified)).toBeNull();
+  });
+
+  test('a text-only response keeps its existing unified content shape (happy path unchanged)', async () => {
+    const unified = await new ResponsesTransformer().transformResponse({
+      id: 'resp_text_only',
+      object: 'response',
+      model: 'gpt-4o',
+      created_at: 1234567890,
+      status: 'completed',
+      output: [
+        {
+          type: 'message',
+          id: 'msg_1',
+          status: 'completed',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'Full answer' }],
+        },
+      ],
+    });
+
+    expect(unified.content).toBe('Full answer');
+  });
+
+  test('a base64 result over the inline limit renders the omission placeholder for chat clients, not a data URI', async () => {
+    // One char past MAX_INLINE_IMAGE_BASE64_CHARS (8 * 1024 * 1024).
+    // Approximate decoded size = 8388609 * 3/4 bytes ≈ 6.0 MB.
+    const oversized = 'A'.repeat(8 * 1024 * 1024 + 1);
+    const unified = await new ResponsesTransformer().transformResponse({
+      id: 'resp_img_oversized',
+      object: 'response',
+      model: 'gpt-image-model',
+      created_at: 1234567890,
+      status: 'completed',
+      output: [
+        { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: oversized },
+      ],
+    });
+
+    // Pure unified content; the size guard applies only to the chat
+    // projection — the typed carry keeps the full payload.
+    expect(unified.content).toBeNull();
+    expect(unified.image_generation_calls?.[0]?.result).toBe(oversized);
+    expect(await chatVisibleContent(unified)).toBe(
+      '[generated image omitted: 6.0 MB exceeds inline limit]'
+    );
+  });
+
+  test('a base64 result exactly at the inline limit still renders as a data URI (boundary)', async () => {
+    const atLimit = 'A'.repeat(8 * 1024 * 1024);
+    const unified = await new ResponsesTransformer().transformResponse({
+      id: 'resp_img_at_limit',
+      object: 'response',
+      model: 'gpt-image-model',
+      created_at: 1234567890,
+      status: 'completed',
+      output: [{ type: 'image_generation_call', id: 'ig_1', status: 'completed', result: atLimit }],
+    });
+
+    expect(await chatVisibleContent(unified)).toBe(
+      `![generated image](data:image/png;base64,${atLimit})`
+    );
+  });
+});
+
+describe('ResponsesTransformer transformStream - image_generation_call rendering', () => {
+  test('a completed image_generation_call output item becomes a unified content delta (markdown data URI)', async () => {
+    const chunks = await transformEvents([
+      {
+        type: 'response.created',
+        response: { id: 'resp_img_s1', model: 'gpt-image-model', created_at: 1234567890 },
+      },
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: {
+          id: 'ig_1',
+          type: 'image_generation_call',
+          status: 'completed',
+          result: TINY_IMAGE_B64,
+        },
+      },
+      { type: 'response.completed', response: {} },
+    ]);
+
+    const contentChunks = chunks.filter(
+      (chunk) => typeof chunk.delta?.content === 'string' && chunk.delta.content.length > 0
+    );
+    expect(contentChunks).toHaveLength(1);
+    expect(contentChunks[0].delta.content).toBe(TINY_IMAGE_MARKDOWN);
+  });
+
+  test('an image_generation_call present only in response.completed still renders, before the final chunk', async () => {
+    const chunks = await transformEvents([
+      {
+        type: 'response.created',
+        response: { id: 'resp_img_s2', model: 'gpt-image-model', created_at: 1234567890 },
+      },
+      {
+        type: 'response.completed',
+        response: {
+          id: 'resp_img_s2',
+          status: 'completed',
+          output: [
+            {
+              id: 'ig_1',
+              type: 'image_generation_call',
+              status: 'completed',
+              result: TINY_IMAGE_B64,
+            },
+          ],
+          usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 },
+        },
+      },
+    ]);
+
+    const contentIndex = chunks.findIndex((chunk) => chunk.delta?.content === TINY_IMAGE_MARKDOWN);
+    const finishIndex = chunks.findIndex((chunk) => chunk.finish_reason);
+    expect(contentIndex).toBeGreaterThan(-1);
+    expect(finishIndex).toBeGreaterThan(contentIndex);
+  });
+
+  test('does not double-render an item that streamed via output_item.done AND appears in response.completed', async () => {
+    const imageItem = {
+      id: 'ig_1',
+      type: 'image_generation_call',
+      status: 'completed',
+      result: TINY_IMAGE_B64,
+    };
+    const chunks = await transformEvents([
+      {
+        type: 'response.created',
+        response: { id: 'resp_img_s3', model: 'gpt-image-model', created_at: 1234567890 },
+      },
+      { type: 'response.output_item.done', output_index: 0, item: imageItem },
+      { type: 'response.completed', response: { id: 'resp_img_s3', output: [imageItem] } },
+    ]);
+
+    const contentChunks = chunks.filter((chunk) => chunk.delta?.content === TINY_IMAGE_MARKDOWN);
+    expect(contentChunks).toHaveLength(1);
+  });
+
+  test('partial-image delta events are skipped (explicitly out of scope) — only the completed item renders', async () => {
+    const chunks = await transformEvents([
+      {
+        type: 'response.created',
+        response: { id: 'resp_img_s4', model: 'gpt-image-model', created_at: 1234567890 },
+      },
+      {
+        type: 'response.image_generation_call.partial_image',
+        output_index: 0,
+        item_id: 'ig_1',
+        partial_image_index: 0,
+        partial_image_b64: 'UEFSVElBTA==',
+      },
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: {
+          id: 'ig_1',
+          type: 'image_generation_call',
+          status: 'completed',
+          result: TINY_IMAGE_B64,
+        },
+      },
+      { type: 'response.completed', response: {} },
+    ]);
+
+    const contentChunks = chunks.filter(
+      (chunk) => typeof chunk.delta?.content === 'string' && chunk.delta.content.length > 0
+    );
+    expect(contentChunks).toHaveLength(1);
+    expect(contentChunks[0].delta.content).toBe(TINY_IMAGE_MARKDOWN);
+    expect(chunks.some((chunk) => JSON.stringify(chunk).includes('UEFSVElBTA=='))).toBe(false);
+  });
+
+  test('a base64 result over the inline limit streams the omission placeholder instead of the data URI', async () => {
+    // Twice MAX_INLINE_IMAGE_BASE64_CHARS (8 * 1024 * 1024).
+    // Approximate decoded size = 16777216 * 3/4 bytes = 12.0 MB.
+    const oversized = 'B'.repeat(2 * 8 * 1024 * 1024);
+    const chunks = await transformEvents([
+      {
+        type: 'response.created',
+        response: { id: 'resp_img_s5', model: 'gpt-image-model', created_at: 1234567890 },
+      },
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: {
+          id: 'ig_1',
+          type: 'image_generation_call',
+          status: 'completed',
+          result: oversized,
+        },
+      },
+      { type: 'response.completed', response: {} },
+    ]);
+
+    const contentChunks = chunks.filter(
+      (chunk) => typeof chunk.delta?.content === 'string' && chunk.delta.content.length > 0
+    );
+    expect(contentChunks).toHaveLength(1);
+    expect(contentChunks[0].delta.content).toBe(
+      '[generated image omitted: 12.0 MB exceeds inline limit]'
+    );
+    // The oversized base64 payload must never reach a CONTENT delta (chat/
+    // messages clients render content strings — that's what the inline size
+    // guard protects). The chunk-level `image_generation_calls` typed carry
+    // deliberately DOES hold the full base64 so responses-facing clients can
+    // receive the native item byte-intact — see the typed-carry describe
+    // below.
+    expect(
+      chunks.some(
+        (chunk) =>
+          typeof chunk.delta?.content === 'string' && chunk.delta.content.includes('BBBBBBBB')
+      )
+    ).toBe(false);
+    expect(contentChunks[0].image_generation_calls?.[0]?.result).toBe(oversized);
+  });
+});
+
+// A markdown-only collapse would be lossy for SAME-format clients: a
+// non-bypass responses -> responses route (e.g. a responses:lite subtype,
+// adapter active, vision fallthrough) would receive `message`/`output_text`
+// markdown instead of the native `image_generation_call` item — and the
+// oversized placeholder would destroy the base64 for clients that take it
+// natively. The typed carry (UnifiedImageGenerationCall) keeps the item
+// intact through the unified layer; the responses-facing formatStream /
+// formatResponse re-emit it natively. On the unary path the typed carry is
+// the ONLY image carrier (unified content stays pure); on the streaming path
+// it rides chunk-level, paired with the chat markdown delta on the same
+// chunk, which the responses-facing formatStream structurally skips.
+describe('ResponsesTransformer typed image_generation_call carry (responses -> responses)', () => {
+  function unifiedStreamFromChunks(chunks: any[]): ReadableStream {
+    return new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(chunk);
+        controller.close();
+      },
+    });
+  }
+
+  async function collectFormatStreamEvents(
+    chunks: any[],
+    transformer = new ResponsesTransformer()
+  ): Promise<any[]> {
+    const reader = transformer.formatStream(unifiedStreamFromChunks(chunks)).getReader();
+    const decoder = new TextDecoder();
+    let output = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      output += decoder.decode(value);
+    }
+    return output
+      .split('\n\n')
+      .filter((block) => block.trim().length > 0)
+      .map((block) => {
+        const dataLine = block.split('\n').find((line) => line.startsWith('data: '));
+        return JSON.parse((dataLine as string).replace(/^data:\s*/, ''));
+      });
+  }
+
+  describe('transformStream carries the typed item alongside the markdown', () => {
+    test('a completed image item carries a typed entry on the SAME chunk as its markdown delta', async () => {
+      const chunks = await transformEvents([
+        {
+          type: 'response.created',
+          response: { id: 'resp_typed_1', model: 'gpt-image-model', created_at: 1234567890 },
+        },
+        {
+          type: 'response.output_item.done',
+          output_index: 0,
+          item: {
+            id: 'ig_1',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: TINY_IMAGE_B64,
+          },
+        },
+        { type: 'response.completed', response: {} },
+      ]);
+
+      const imageChunks = chunks.filter((chunk) => chunk.image_generation_calls);
+      expect(imageChunks).toHaveLength(1);
+      expect(imageChunks[0].image_generation_calls).toEqual([
+        { id: 'ig_1', status: 'completed', result: TINY_IMAGE_B64 },
+      ]);
+      // The chat-format markdown rendering rides the same chunk's content.
+      expect(imageChunks[0].delta.content).toBe(TINY_IMAGE_MARKDOWN);
+    });
+
+    test('the typed entry is chunk-level, NOT inside delta (chat formatters forward delta by reference)', async () => {
+      const chunks = await transformEvents([
+        {
+          type: 'response.created',
+          response: { id: 'resp_typed_2', model: 'gpt-image-model', created_at: 1234567890 },
+        },
+        {
+          type: 'response.output_item.done',
+          output_index: 0,
+          item: {
+            id: 'ig_1',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: TINY_IMAGE_B64,
+          },
+        },
+        { type: 'response.completed', response: {} },
+      ]);
+
+      const imageChunk = chunks.find((chunk) => chunk.image_generation_calls);
+      expect(imageChunk).toBeDefined();
+      expect(imageChunk.delta.image_generation_calls).toBeUndefined();
+    });
+
+    test('the completed-fallback also carries the typed entry, without double-carrying deduped items', async () => {
+      const imageItem = {
+        id: 'ig_1',
+        type: 'image_generation_call',
+        status: 'completed',
+        result: TINY_IMAGE_B64,
+      };
+      const chunks = await transformEvents([
+        {
+          type: 'response.created',
+          response: { id: 'resp_typed_3', model: 'gpt-image-model', created_at: 1234567890 },
+        },
+        { type: 'response.output_item.done', output_index: 0, item: imageItem },
+        { type: 'response.completed', response: { id: 'resp_typed_3', output: [imageItem] } },
+      ]);
+
+      const imageChunks = chunks.filter((chunk) => chunk.image_generation_calls);
+      expect(imageChunks).toHaveLength(1);
+    });
+
+    test('a completed-only item (never streamed via output_item.done) still gets the typed carry', async () => {
+      const chunks = await transformEvents([
+        {
+          type: 'response.created',
+          response: { id: 'resp_typed_4', model: 'gpt-image-model', created_at: 1234567890 },
+        },
+        {
+          type: 'response.completed',
+          response: {
+            id: 'resp_typed_4',
+            status: 'completed',
+            output: [
+              {
+                id: 'ig_9',
+                type: 'image_generation_call',
+                status: 'completed',
+                result: TINY_IMAGE_B64,
+              },
+            ],
+          },
+        },
+      ]);
+
+      const imageChunks = chunks.filter((chunk) => chunk.image_generation_calls);
+      expect(imageChunks).toHaveLength(1);
+      expect(imageChunks[0].image_generation_calls[0]).toEqual({
+        id: 'ig_9',
+        status: 'completed',
+        result: TINY_IMAGE_B64,
+      });
+    });
+  });
+
+  describe('formatStream re-emits typed items as native output items', () => {
+    const imageChunkFor = (result: string) => ({
+      id: 'resp_native_1',
+      model: 'gpt-image-model',
+      created: 1234567890,
+      delta: { content: `![generated image](data:image/png;base64,${result})` },
+      image_generation_calls: [{ id: 'ig_1', status: 'completed', result }],
+      finish_reason: null,
+    });
+
+    const finishChunk = () => ({
+      id: 'resp_native_1',
+      model: 'gpt-image-model',
+      created: 1234567890,
+      finish_reason: 'stop',
+      usage: {
+        input_tokens: 5,
+        output_tokens: 1,
+        total_tokens: 6,
+        reasoning_tokens: 0,
+        cached_tokens: 0,
+        cache_creation_tokens: 0,
+      },
+    });
+
+    test('emits a native image_generation_call output item (byte-intact) instead of markdown text', async () => {
+      const events = await collectFormatStreamEvents([
+        imageChunkFor(TINY_IMAGE_B64),
+        finishChunk(),
+      ]);
+
+      const doneEvents = events.filter(
+        (e) => e.type === 'response.output_item.done' && e.item?.type === 'image_generation_call'
+      );
+      expect(doneEvents).toHaveLength(1);
+      expect(doneEvents[0].item).toEqual({
+        id: 'ig_1',
+        type: 'image_generation_call',
+        status: 'completed',
+        result: TINY_IMAGE_B64,
+      });
+
+      // The paired markdown must NOT also stream as output_text — the native
+      // item is the only carrier for a Responses-format client.
+      expect(events.some((e) => e.type === 'response.output_text.delta')).toBe(false);
+      expect(JSON.stringify(events).includes('![generated image]')).toBe(false);
+    });
+
+    test('the final response.completed output array includes the native image item', async () => {
+      const events = await collectFormatStreamEvents([
+        imageChunkFor(TINY_IMAGE_B64),
+        finishChunk(),
+      ]);
+
+      const completed = events.find((e) => e.type === 'response.completed');
+      expect(completed).toBeDefined();
+      const imageItems = completed.response.output.filter(
+        (item: any) => item.type === 'image_generation_call'
+      );
+      expect(imageItems).toHaveLength(1);
+      expect(imageItems[0].result).toBe(TINY_IMAGE_B64);
+    });
+
+    test('an OVERSIZED result re-emits with the FULL base64 — the native format has no inline cap', async () => {
+      const oversized = 'C'.repeat(2 * 8 * 1024 * 1024);
+      // transformStream renders the placeholder on content for oversized
+      // items — mirror that pairing here.
+      const events = await collectFormatStreamEvents([
+        {
+          id: 'resp_native_2',
+          model: 'gpt-image-model',
+          created: 1234567890,
+          delta: { content: '[generated image omitted: 12.0 MB exceeds inline limit]' },
+          image_generation_calls: [{ id: 'ig_big', status: 'completed', result: oversized }],
+          finish_reason: null,
+        },
+        finishChunk(),
+      ]);
+
+      const doneEvent = events.find(
+        (e) => e.type === 'response.output_item.done' && e.item?.type === 'image_generation_call'
+      );
+      expect(doneEvent).toBeDefined();
+      expect(doneEvent.item.result).toBe(oversized);
+      // The placeholder must not leak into any text.
+      expect(JSON.stringify(events).includes('exceeds inline limit')).toBe(false);
+    });
+
+    test('message text on OTHER chunks still streams normally alongside a native image item', async () => {
+      const events = await collectFormatStreamEvents([
+        {
+          id: 'resp_native_3',
+          model: 'gpt-image-model',
+          created: 1234567890,
+          delta: { content: 'Here is your image:' },
+          finish_reason: null,
+        },
+        imageChunkFor(TINY_IMAGE_B64),
+        finishChunk(),
+      ]);
+
+      const textDeltas = events.filter((e) => e.type === 'response.output_text.delta');
+      expect(textDeltas).toHaveLength(1);
+      expect(textDeltas[0].delta).toBe('Here is your image:');
+
+      const completed = events.find((e) => e.type === 'response.completed');
+      const types = completed.response.output.map((item: any) => item.type);
+      expect(types).toContain('message');
+      expect(types).toContain('image_generation_call');
+      const messageItem = completed.response.output.find((item: any) => item.type === 'message');
+      expect(messageItem.content[0].text).toBe('Here is your image:');
+    });
+
+    test('full streaming round-trip (provider SSE -> unified -> client SSE) keeps the item byte-intact', async () => {
+      const unifiedChunks = await transformEvents([
+        {
+          type: 'response.created',
+          response: { id: 'resp_rt_1', model: 'gpt-image-model', created_at: 1234567890 },
+        },
+        {
+          type: 'response.output_item.done',
+          output_index: 0,
+          item: {
+            id: 'ig_rt',
+            type: 'image_generation_call',
+            status: 'completed',
+            result: TINY_IMAGE_B64,
+          },
+        },
+        {
+          type: 'response.completed',
+          response: { usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 } },
+        },
+      ]);
+
+      const events = await collectFormatStreamEvents(unifiedChunks);
+      const doneEvent = events.find(
+        (e) => e.type === 'response.output_item.done' && e.item?.type === 'image_generation_call'
+      );
+      expect(doneEvent).toBeDefined();
+      expect(doneEvent.item.result).toBe(TINY_IMAGE_B64);
+      expect(events.some((e) => e.type === 'response.output_text.delta')).toBe(false);
+    });
+  });
+
+  describe('formatResponse (unary) re-emits typed items as native output items', () => {
+    test('transformResponse attaches the typed items and keeps unified content PURE', async () => {
+      const unified = await new ResponsesTransformer().transformResponse({
+        id: 'resp_unary_typed',
+        object: 'response',
+        model: 'gpt-image-model',
+        created_at: 1234567890,
+        status: 'completed',
+        output: [
+          {
+            type: 'message',
+            id: 'msg_1',
+            status: 'completed',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Here is your image:' }],
+          },
+          {
+            type: 'image_generation_call',
+            id: 'ig_1',
+            status: 'completed',
+            result: TINY_IMAGE_B64,
+          },
+        ],
+      });
+
+      expect(unified.image_generation_calls).toEqual([
+        { id: 'ig_1', status: 'completed', result: TINY_IMAGE_B64 },
+      ]);
+      // PURE authored text — the chat-format markdown projection is composed
+      // by the client-facing renderers, never baked in here.
+      expect(unified.content).toBe('Here is your image:');
+    });
+
+    test('a result-less image item still contributes no typed entry', async () => {
+      const unified = await new ResponsesTransformer().transformResponse({
+        id: 'resp_unary_noresult',
+        object: 'response',
+        model: 'gpt-image-model',
+        created_at: 1234567890,
+        status: 'completed',
+        output: [{ type: 'image_generation_call', id: 'ig_1', status: 'completed' }],
+      });
+
+      expect(unified.image_generation_calls).toBeUndefined();
+    });
+
+    test('formatResponse emits the native item and strips the paired markdown from the message text', async () => {
+      const transformer = new ResponsesTransformer();
+      const unified = await transformer.transformResponse({
+        id: 'resp_unary_rt',
+        object: 'response',
+        model: 'gpt-image-model',
+        created_at: 1234567890,
+        status: 'completed',
+        output: [
+          {
+            type: 'message',
+            id: 'msg_1',
+            status: 'completed',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: 'Here is your image:' }],
+          },
+          {
+            type: 'image_generation_call',
+            id: 'ig_1',
+            status: 'completed',
+            result: TINY_IMAGE_B64,
+          },
+        ],
+      });
+
+      const formatted = await transformer.formatResponse(unified as any);
+
+      const imageItems = formatted.output.filter(
+        (item: any) => item.type === 'image_generation_call'
+      );
+      expect(imageItems).toHaveLength(1);
+      expect(imageItems[0]).toMatchObject({
+        type: 'image_generation_call',
+        id: 'ig_1',
+        status: 'completed',
+        result: TINY_IMAGE_B64,
+      });
+
+      const messageItem = formatted.output.find((item: any) => item.type === 'message');
+      expect(messageItem.content[0].text).toBe('Here is your image:');
+      expect(JSON.stringify(formatted).includes('![generated image]')).toBe(false);
+    });
+
+    test('an image-only unary response round-trips as a native item (no markdown text)', async () => {
+      const transformer = new ResponsesTransformer();
+      const unified = await transformer.transformResponse({
+        id: 'resp_unary_imgonly',
+        object: 'response',
+        model: 'gpt-image-model',
+        created_at: 1234567890,
+        status: 'completed',
+        output: [
+          {
+            type: 'image_generation_call',
+            id: 'ig_1',
+            status: 'completed',
+            result: TINY_IMAGE_B64,
+          },
+        ],
+      });
+
+      // Pure unified content: nothing authored, nothing baked. The typed
+      // carry is what keeps the empty-completion detector seeing visible
+      // output (see empty-completion.ts countTypedImageGenerationCalls).
+      expect(unified.content).toBeNull();
+      expect(unified.image_generation_calls?.[0]?.result).toBe(TINY_IMAGE_B64);
+
+      const formatted = await transformer.formatResponse(unified as any);
+      const imageItems = formatted.output.filter(
+        (item: any) => item.type === 'image_generation_call'
+      );
+      expect(imageItems).toHaveLength(1);
+      expect(imageItems[0].result).toBe(TINY_IMAGE_B64);
+      const messageItem = formatted.output.find((item: any) => item.type === 'message');
+      expect(messageItem.content[0].text).toBe('');
+    });
+
+    test('an OVERSIZED unary result re-emits byte-intact natively — the placeholder never reaches the client', async () => {
+      const oversized = 'D'.repeat(8 * 1024 * 1024 + 1);
+      const transformer = new ResponsesTransformer();
+      const unified = await transformer.transformResponse({
+        id: 'resp_unary_big',
+        object: 'response',
+        model: 'gpt-image-model',
+        created_at: 1234567890,
+        status: 'completed',
+        output: [
+          { type: 'image_generation_call', id: 'ig_big', status: 'completed', result: oversized },
+        ],
+      });
+
+      // Pure unified content (the guarded placeholder exists only in the
+      // chat projection)...
+      expect(unified.content).toBeNull();
+      // ...while the typed carry keeps the full payload.
+      expect(unified.image_generation_calls?.[0]?.result).toBe(oversized);
+
+      const formatted = await transformer.formatResponse(unified as any);
+      const imageItem = formatted.output.find((item: any) => item.type === 'image_generation_call');
+      expect(imageItem.result).toBe(oversized);
+      const messageItem = formatted.output.find((item: any) => item.type === 'message');
+      expect(messageItem.content[0].text).toBe('');
+      expect(JSON.stringify(formatted).includes('exceeds inline limit')).toBe(false);
+    });
+  });
+
+  describe('unary content-corruption probe — authored text colliding with rendered image segments', () => {
+    // The model can legitimately AUTHOR text containing the exact string of a
+    // rendered image segment (echoing a small image's markdown, or quoting
+    // the oversized-omission placeholder). The authored copy is genuine
+    // message content and must reach every client byte-intact; the rendered
+    // segment is a chat-format projection a responses client never sees (it
+    // gets the native item instead). Any indexOf-based "remove the rendered
+    // segment" surgery removes the FIRST occurrence — the authored copy —
+    // and leaks the appended rendering: content corruption.
+
+    const authoredWithMarkdown = `Check this markdown I wrote myself:\n${TINY_IMAGE_MARKDOWN}\nNeat, right?`;
+
+    const collisionResponseBody = () => ({
+      id: 'resp_probe_md',
+      object: 'response',
+      model: 'gpt-image-model',
+      created_at: 1234567890,
+      status: 'completed',
+      output: [
+        {
+          type: 'message',
+          id: 'msg_1',
+          status: 'completed',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: authoredWithMarkdown }],
+        },
+        {
+          type: 'image_generation_call',
+          id: 'ig_1',
+          status: 'completed',
+          result: TINY_IMAGE_B64,
+        },
+      ],
+    });
+
+    test('authored text containing an exact copy of the image markdown reaches a responses client byte-intact', async () => {
+      const transformer = new ResponsesTransformer();
+      const unified = await transformer.transformResponse(collisionResponseBody());
+      const formatted = await transformer.formatResponse(unified as any);
+
+      // The native item is the image's only carrier...
+      const imageItems = formatted.output.filter(
+        (item: any) => item.type === 'image_generation_call'
+      );
+      expect(imageItems).toHaveLength(1);
+      expect(imageItems[0].result).toBe(TINY_IMAGE_B64);
+
+      // ...and the AUTHORED text — including its own copy of the markdown —
+      // survives byte-intact: nothing removed, no appended rendering leaked.
+      const messageItem = formatted.output.find((item: any) => item.type === 'message');
+      expect(messageItem.content[0].text).toBe(authoredWithMarkdown);
+    });
+
+    test('authored text quoting the oversized-omission placeholder reaches a responses client byte-intact', async () => {
+      const oversized = 'B'.repeat(2 * 8 * 1024 * 1024); // placeholder reads "12.0 MB"
+      const placeholder = '[generated image omitted: 12.0 MB exceeds inline limit]';
+      const authored = `If a file is too large you may see "${placeholder}" instead of the image.`;
+      const transformer = new ResponsesTransformer();
+      const unified = await transformer.transformResponse({
+        id: 'resp_probe_ph',
+        object: 'response',
+        model: 'gpt-image-model',
+        created_at: 1234567890,
+        status: 'completed',
+        output: [
+          {
+            type: 'message',
+            id: 'msg_1',
+            status: 'completed',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: authored }],
+          },
+          { type: 'image_generation_call', id: 'ig_big', status: 'completed', result: oversized },
+        ],
+      });
+
+      const formatted = await transformer.formatResponse(unified as any);
+
+      const imageItem = formatted.output.find((item: any) => item.type === 'image_generation_call');
+      expect(imageItem.result).toBe(oversized);
+
+      const messageItem = formatted.output.find((item: any) => item.type === 'message');
+      expect(messageItem.content[0].text).toBe(authored);
+      // Exactly ONE occurrence — the authored quote. The rendered
+      // placeholder itself must never leak into the responses payload.
+      expect(messageItem.content[0].text.split(placeholder).length - 1).toBe(1);
+    });
+
+    test('the same authored-collision response renders authored text + appended markdown for a CHAT client (duplication is genuine content)', async () => {
+      const unified = await new ResponsesTransformer().transformResponse(collisionResponseBody());
+      const chat = await new OpenAITransformer().formatResponse(unified as any);
+
+      expect(chat.choices[0].message.content).toBe(
+        `${authoredWithMarkdown}\n${TINY_IMAGE_MARKDOWN}`
+      );
+    });
+  });
+});
+
 describe('ResponsesTransformer formatStream - error handling (client-facing)', () => {
   function unifiedStreamFromChunks(chunks: any[]): ReadableStream {
     return new ReadableStream({
@@ -792,6 +1710,54 @@ describe('ResponsesTransformer transformStream -> OpenAITransformer formatStream
     // Still rendered as an error (this was a hard failure, not an incomplete).
     const errorChunk = chunks.find((c) => c !== '[DONE]' && c.error);
     expect(errorChunk).toBeDefined();
+  });
+
+  test('a streamed completed image_generation_call reaches a chat client as a markdown data-URI content delta', async () => {
+    const chunks = await transformAndFormatAsChat([
+      {
+        type: 'response.created',
+        response: { id: 'resp_img_chat', model: 'gpt-image-model', created_at: 1234567890 },
+      },
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: {
+          id: 'ig_1',
+          type: 'image_generation_call',
+          status: 'completed',
+          result: TINY_IMAGE_B64,
+        },
+      },
+      {
+        type: 'response.completed',
+        response: {
+          id: 'resp_img_chat',
+          status: 'completed',
+          output: [
+            {
+              id: 'ig_1',
+              type: 'image_generation_call',
+              status: 'completed',
+              result: TINY_IMAGE_B64,
+            },
+          ],
+          usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 },
+        },
+      },
+    ]);
+
+    const contentChunks = chunks.filter(
+      (c) =>
+        c !== '[DONE]' &&
+        typeof c.choices?.[0]?.delta?.content === 'string' &&
+        c.choices[0].delta.content.length > 0
+    );
+    expect(contentChunks).toHaveLength(1);
+    expect(contentChunks[0].choices[0].delta.content).toBe(TINY_IMAGE_MARKDOWN);
+    expect(chunks.some((c) => c !== '[DONE]' && c.choices?.[0]?.finish_reason === 'stop')).toBe(
+      true
+    );
+    expect(chunks.at(-1)).toBe('[DONE]');
   });
 
   test('response.incomplete carrying usage propagates that usage to the chat client alongside the finish_reason', async () => {

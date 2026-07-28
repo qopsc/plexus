@@ -500,4 +500,41 @@ describe('OpenAITransformer.formatStream robustness', () => {
     expect(chunks.filter((c) => c === '[DONE]')).toHaveLength(1);
     expect(chunks.at(-1)).toBe('[DONE]');
   });
+
+  test('a unified chunk carrying typed image_generation_calls renders ONLY the markdown content into chat SSE', async () => {
+    // responses.ts transformStream pairs each completed image item's typed
+    // carry (chunk-level `image_generation_calls`, full base64) with its
+    // chat-format markdown rendering on `delta.content`. A chat-format
+    // client must receive exactly the markdown — the typed field (which can
+    // hold multi-megabyte, uncapped base64) must never leak into the chat
+    // wire chunk.
+    const markdown = '![generated image](data:image/png;base64,aGVsbG8=)';
+    const unifiedStream = unifiedStreamFromChunks([
+      {
+        id: 'chatcmpl_img',
+        model: 'gpt-image-model',
+        created: 1234567890,
+        delta: { content: markdown },
+        image_generation_calls: [{ id: 'ig_1', status: 'completed', result: 'aGVsbG8=' }],
+        finish_reason: null,
+      },
+      {
+        id: 'chatcmpl_img',
+        model: 'gpt-image-model',
+        created: 1234567890,
+        delta: {},
+        finish_reason: 'stop',
+      },
+    ]);
+
+    const formatted = new OpenAITransformer().formatStream(unifiedStream);
+    const chunks = await readOpenAISSEChunks(formatted as ReadableStream<Uint8Array>);
+
+    const contentChunks = chunks.filter((c) => c !== '[DONE]' && c.choices?.[0]?.delta?.content);
+    expect(contentChunks).toHaveLength(1);
+    expect(contentChunks[0].choices[0].delta.content).toBe(markdown);
+    expect(
+      chunks.some((c) => c !== '[DONE]' && JSON.stringify(c).includes('image_generation_calls'))
+    ).toBe(false);
+  });
 });
