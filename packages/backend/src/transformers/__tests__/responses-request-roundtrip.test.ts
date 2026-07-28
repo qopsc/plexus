@@ -4,6 +4,7 @@ import {
   normalizeCompositeResponsesCallIds,
   normalizeResponsesReasoningContent,
 } from '../responses';
+import { OpenAITransformer } from '../openai';
 
 /**
  * Round-trip tests for the Responses API transformer.
@@ -353,12 +354,109 @@ describe('parseRequest conditional-spread hygiene (omitted fields leave no own p
     ]);
   });
 
+  it('a present text.format still forwards as response_format (lock one example)', async () => {
+    const transformer = new ResponsesTransformer();
+    const unified = await transformer.parseRequest({
+      ...MINIMAL_REQUEST,
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'result',
+          schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
+        },
+      },
+    });
+
+    expect('response_format' in unified).toBe(true);
+    expect(unified.response_format).toEqual({
+      type: 'json_schema',
+      json_schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
+      name: 'result',
+    });
+  });
+
   it('an explicit stream:false still forwards as a real own property', async () => {
     const transformer = new ResponsesTransformer();
     const unified = await transformer.parseRequest({ ...MINIMAL_REQUEST, stream: false });
 
     expect('stream' in unified).toBe(true);
     expect(unified.stream).toBe(false);
+  });
+
+  describe('structured-output descriptor carry (text.format name/description/strict)', () => {
+    // The Responses `text.format` structured-output descriptor is more than
+    // the schema: clients also send `name`, `description`, and `strict`.
+    // Discarding them forces the responses -> chat emission to fabricate
+    // `name: "response_schema"` / `strict: true`, silently overriding what
+    // the client asked for (e.g. strict: false).
+    const DESCRIPTOR_REQUEST = {
+      ...MINIMAL_REQUEST,
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'weather_report',
+          description: 'A structured weather report',
+          strict: false,
+          schema: { type: 'object', properties: { temp: { type: 'number' } } },
+        },
+      },
+    };
+
+    it('parseRequest carries name/description/strict on the unified response_format', async () => {
+      const unified = await new ResponsesTransformer().parseRequest(DESCRIPTOR_REQUEST);
+
+      expect(unified.response_format).toEqual({
+        type: 'json_schema',
+        json_schema: { type: 'object', properties: { temp: { type: 'number' } } },
+        name: 'weather_report',
+        description: 'A structured weather report',
+        strict: false,
+      });
+    });
+
+    it('the outbound Chat payload emits the client-supplied descriptor values (responses -> chat)', async () => {
+      const unified = await new ResponsesTransformer().parseRequest(DESCRIPTOR_REQUEST);
+      const chatPayload = await new OpenAITransformer().transformRequest(unified);
+
+      expect(chatPayload.response_format).toEqual({
+        type: 'json_schema',
+        json_schema: {
+          name: 'weather_report',
+          description: 'A structured weather report',
+          schema: { type: 'object', properties: { temp: { type: 'number' } } },
+          strict: false,
+        },
+      });
+    });
+
+    it('fallbacks apply ONLY when the client omitted the descriptor fields', async () => {
+      const unified = await new ResponsesTransformer().parseRequest({
+        ...MINIMAL_REQUEST,
+        text: {
+          format: {
+            type: 'json_schema',
+            schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
+          },
+        },
+      });
+      const chatPayload = await new OpenAITransformer().transformRequest(unified);
+
+      expect(chatPayload.response_format).toEqual({
+        type: 'json_schema',
+        json_schema: {
+          name: 'response_schema',
+          schema: { type: 'object', properties: { ok: { type: 'boolean' } } },
+          strict: true,
+        },
+      });
+    });
+
+    it('strict: false survives to the outbound chat payload (must not be clobbered to true)', async () => {
+      const unified = await new ResponsesTransformer().parseRequest(DESCRIPTOR_REQUEST);
+      const chatPayload = await new OpenAITransformer().transformRequest(unified);
+
+      expect(chatPayload.response_format.json_schema.strict).toBe(false);
+    });
   });
 
   it('explicit values still forward (spot-check stream, max_output_tokens, metadata)', async () => {

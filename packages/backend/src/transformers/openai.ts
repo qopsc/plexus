@@ -3,6 +3,7 @@ import { UnifiedChatRequest, UnifiedChatResponse } from '../types/unified';
 import { createParser, EventSourceMessage } from 'eventsource-parser';
 import { encode } from 'eventsource-encoder';
 import { normalizeOpenAIChatUsage } from '../utils/usage-normalizer';
+import { GEMINI_MALFORMED_FUNCTION_CALL_CODE } from '../utils/gemini-malformed-function-call';
 
 /**
  * OpenAITransformer
@@ -106,13 +107,21 @@ export class OpenAITransformer implements Transformer {
 
     if (request.response_format) {
       if (request.response_format.type === 'json_schema' && request.response_format.json_schema) {
-        // OpenAI json_schema mode requires {name, schema, strict} wrapping
+        // OpenAI json_schema mode requires {name, schema, strict} wrapping.
+        // The client-supplied descriptor (carried on the unified
+        // response_format — see types/unified.ts) wins; the fabricated
+        // `response_schema` / `strict: true` values are fallbacks ONLY for
+        // clients that omitted them (`?? `— an explicit strict: false must
+        // survive).
         out.response_format = {
           type: 'json_schema',
           json_schema: {
-            name: 'response_schema',
+            name: request.response_format.name ?? 'response_schema',
+            ...(request.response_format.description !== undefined
+              ? { description: request.response_format.description }
+              : {}),
             schema: request.response_format.json_schema,
-            strict: true,
+            strict: request.response_format.strict ?? true,
           },
         };
       } else {
@@ -247,6 +256,47 @@ export class OpenAITransformer implements Transformer {
     const encoder = new TextEncoder();
     const reader = stream.getReader();
     let hasSentError = false;
+    // Only the legacy Gemini MALFORMED_FUNCTION_CALL defect (a transient,
+    // retry-worthy signal — see utils/gemini-malformed-function-call.ts)
+    // intentionally ends the stream WITHOUT `[DONE]`, so it reads as an
+    // aborted stream rather than a clean finish. Any other upstream error
+    // (Anthropic mid-stream error, Responses response.failed/error) is a
+    // genuine terminal condition and should still close cleanly with
+    // `[DONE]` so OpenAI-compatible clients don't hang waiting for one.
+    let suppressDone = false;
+    // Tracks whether any terminal signal (a real finish_reason chunk, an
+    // error chunk rendered as a normal finish, or the hard-error JSON
+    // payload) has already reached the client, so the end-of-stream flush
+    // below never synthesizes a redundant one.
+    let hasSentFinish = false;
+    // Some OpenAI-compatible upstreams (and Plexus itself, for Copilot-native
+    // streaming — see services/oauth/oauth-native-request.ts) request
+    // `stream_options.include_usage`, which sends a trailing
+    // `{choices: [], usage: {...}}` frame AFTER the real finish chunk.
+    // transformStream has no real choice to read there, so it can't tell
+    // that frame apart from a genuinely empty/terminal chunk — this flag lets
+    // exactly one such trailing usage frame still reach the client even
+    // though a terminal signal was already sent, without reopening the door
+    // for a second finish_reason or error chunk.
+    let hasForwardedTrailingUsage = false;
+    let lastChunkId: string | undefined;
+    let lastChunkModel: string | undefined;
+
+    const isEmptyDelta = (delta: any): boolean =>
+      !delta || (!delta.role && !delta.content && !delta.reasoning_content && !delta.tool_calls);
+
+    const buildChatUsagePayload = (usage: any) =>
+      usage
+        ? {
+            prompt_tokens: usage.input_tokens + (usage.cached_tokens || 0),
+            completion_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            prompt_tokens_details: usage.cached_tokens
+              ? { cached_tokens: usage.cached_tokens }
+              : null,
+            reasoning_tokens: usage.reasoning_tokens,
+          }
+        : undefined;
 
     return new ReadableStream({
       async start(controller) {
@@ -254,7 +304,36 @@ export class OpenAITransformer implements Transformer {
           while (true) {
             const { done, value: unifiedChunk } = await reader.read();
             if (done) {
-              if (!hasSentError) {
+              if (!hasSentFinish) {
+                // Source ended without ever emitting a finish_reason
+                // (upstream aborted, error dropped upstream of us, or zero
+                // parsable events): synthesize one so OpenAI-compatible
+                // clients never see a stream with no stop chunk.
+                //
+                // With ZERO parsable chunks there is no upstream id to echo,
+                // so synthesize one (this file has no id-generation
+                // convention of its own; `chatcmpl_` matches the OpenAI wire
+                // prefix). No `model` is synthesized in that case: this
+                // formatter's only input is the unified chunk stream itself
+                // — it has no request context — so when no chunk ever
+                // arrived the model is genuinely unknowable here, and the
+                // field is omitted (JSON drops the undefined) rather than
+                // fabricated.
+                controller.enqueue(
+                  encoder.encode(
+                    encode({
+                      data: JSON.stringify({
+                        id: lastChunkId ?? `chatcmpl_${crypto.randomUUID()}`,
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: lastChunkModel,
+                        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                      }),
+                    })
+                  )
+                );
+              }
+              if (!suppressDone) {
                 controller.enqueue(encoder.encode(encode({ data: '[DONE]' })));
               }
               break;
@@ -262,7 +341,95 @@ export class OpenAITransformer implements Transformer {
 
             if (hasSentError) continue;
 
+            lastChunkId = unifiedChunk.id ?? lastChunkId;
+            lastChunkModel = unifiedChunk.model ?? lastChunkModel;
+
+            // Once any terminal signal has been rendered — a hard-error
+            // payload OR an error-channel chunk rendered as a normal finish
+            // (e.g. the `length` case below) — close the door on everything
+            // else so a stray/duplicate chunk can never produce a second
+            // terminal payload. Mirrors the unconditional single-latch
+            // pattern used by the sibling formatters (formatAnthropicStream's
+            // `hasSentFinish` guard, formatGeminiStream's `hasSentError`
+            // guard). The one carved-out exception is a single trailing
+            // usage-only frame (see `hasForwardedTrailingUsage` above):
+            // rendered without a finish_reason (whatever transformStream put
+            // there, fabricated or not, is ignored) since it is metadata, not
+            // a second finish.
+            if (hasSentFinish) {
+              const isTrailingUsageOnly =
+                !hasForwardedTrailingUsage &&
+                unifiedChunk.event !== 'error' &&
+                !!unifiedChunk.usage &&
+                isEmptyDelta(unifiedChunk.delta);
+
+              if (!isTrailingUsageOnly) continue;
+
+              hasForwardedTrailingUsage = true;
+              const usagePayload = buildChatUsagePayload(unifiedChunk.usage);
+              controller.enqueue(
+                encoder.encode(
+                  encode({
+                    data: JSON.stringify({
+                      id: unifiedChunk.id,
+                      object: 'chat.completion.chunk',
+                      created: unifiedChunk.created || Math.floor(Date.now() / 1000),
+                      model: unifiedChunk.model,
+                      choices: [],
+                      ...(usagePayload ? { usage: usagePayload } : {}),
+                    }),
+                  })
+                )
+              );
+              continue;
+            }
+
             if (unifiedChunk.event === 'error') {
+              if (unifiedChunk.finish_reason) {
+                // A recognizable, non-fatal finish (e.g. Responses
+                // `response.incomplete` with reason `max_output_tokens` or
+                // `content_filter`) was carried through the error-chunk
+                // channel; render it as a normal finish instead of an error
+                // payload. Forward any final usage the upstream attached to
+                // this same chunk (see responses.ts transformStream) using
+                // the same usage-shaping helper as everywhere else in this
+                // file, so chat-format clients still receive it.
+                const usagePayload = buildChatUsagePayload(unifiedChunk.usage);
+                controller.enqueue(
+                  encoder.encode(
+                    encode({
+                      data: JSON.stringify({
+                        id: unifiedChunk.id,
+                        object: 'chat.completion.chunk',
+                        created: unifiedChunk.created || Math.floor(Date.now() / 1000),
+                        model: unifiedChunk.model,
+                        choices: [
+                          { index: 0, delta: {}, finish_reason: unifiedChunk.finish_reason },
+                        ],
+                        ...(usagePayload ? { usage: usagePayload } : {}),
+                      }),
+                    })
+                  )
+                );
+                hasSentFinish = true;
+                continue;
+              }
+
+              // The legacy Gemini MALFORMED_FUNCTION_CALL defect keeps its
+              // existing, specific rendering (downstream/clients may already
+              // key off this exact code) and its [DONE]-suppression. Any
+              // other hard error (Anthropic mid-stream error, Responses
+              // response.failed/error, or anything else routed through this
+              // channel) propagates its own upstream code instead of being
+              // mislabeled with Gemini's — falling back to a neutral generic
+              // only when the upstream genuinely didn't supply one.
+              const isLegacyGeminiMalformedCall =
+                unifiedChunk.error?.code === GEMINI_MALFORMED_FUNCTION_CALL_CODE;
+              // Same final-usage forwarding as the recognizable-finish
+              // branch above — a hard failure (e.g. Responses
+              // response.failed) can still carry final usage.
+              const usagePayload = buildChatUsagePayload(unifiedChunk.usage);
+
               controller.enqueue(
                 encoder.encode(
                   encode({
@@ -270,14 +437,25 @@ export class OpenAITransformer implements Transformer {
                       error: {
                         message: unifiedChunk.error?.message,
                         type: 'server_error',
-                        code: 'upstream_malformed_function_call',
+                        code: isLegacyGeminiMalformedCall
+                          ? 'upstream_malformed_function_call'
+                          : unifiedChunk.error?.code || 'upstream_error',
                       },
+                      ...(usagePayload ? { usage: usagePayload } : {}),
                     }),
                   })
                 )
               );
               hasSentError = true;
+              hasSentFinish = true;
+              if (isLegacyGeminiMalformedCall) {
+                suppressDone = true;
+              }
               continue;
+            }
+
+            if (unifiedChunk.finish_reason) {
+              hasSentFinish = true;
             }
 
             const choice: any = {

@@ -181,6 +181,17 @@ export class ResponsesTransformer implements Transformer {
             response_format: {
               type: input.text.format.type,
               json_schema: input.text.format.schema,
+              // Carry the full structured-output descriptor: dropping
+              // name/description/strict would force the responses -> chat
+              // emission to fabricate `name: "response_schema"` /
+              // `strict: true` over the client-supplied values.
+              ...(input.text.format.name !== undefined ? { name: input.text.format.name } : {}),
+              ...(input.text.format.description !== undefined
+                ? { description: input.text.format.description }
+                : {}),
+              ...(input.text.format.strict !== undefined
+                ? { strict: input.text.format.strict }
+                : {}),
             },
           }
         : {}),
@@ -1092,6 +1103,86 @@ export class ResponsesTransformer implements Transformer {
                     hasFunctionCall || completedResponseHasFunctionCall ? 'tool_calls' : 'stop',
                   usage: normalizedUsage,
                 });
+              } else if (data.type === 'response.failed') {
+                // Upstream reported a hard failure mid-stream. Surface it as
+                // a unified error chunk (same shape OpenAITransformer.formatStream
+                // already renders) instead of silently ending the stream.
+                // Propagate final usage (when the upstream included it
+                // alongside the failure) so chat-format clients still
+                // receive an accurate token count for the turn instead of
+                // silently losing it.
+                const err = data.response?.error || {};
+                const usage = data.response?.usage;
+                const normalizedUsage = usage ? normalizeOpenAIResponsesUsage(usage) : undefined;
+                controller.enqueue({
+                  id: responseId || data.response?.id || '',
+                  model: responseModel || data.response?.model || '',
+                  created: Math.floor(Date.now() / 1000),
+                  event: 'error',
+                  delta: {},
+                  error: {
+                    statusCode: 500,
+                    code: err.code || 'response_failed',
+                    message: err.message || 'The model response failed to complete.',
+                  },
+                  ...(normalizedUsage ? { usage: normalizedUsage } : {}),
+                });
+              } else if (data.type === 'response.incomplete') {
+                // Upstream ended the response early (e.g. hitting
+                // max_output_tokens, or a content_filter cutoff) rather than
+                // failing outright. Carry both the OpenAI-compatible finish
+                // reason AND the raw incomplete_details on the unified chunk
+                // — formatStream (both chat- and responses-facing) needs
+                // incomplete_details to tell an "ended incomplete" chunk
+                // apart from a genuine response.failed hard error. When the
+                // upstream omits incomplete_details entirely, default to
+                // { reason: 'unknown' } so the chunk still reads as an
+                // incomplete (not a hard failure) downstream. Also propagate
+                // final usage, same as response.failed above.
+                const incompleteDetails = data.response?.incomplete_details ?? {
+                  reason: 'unknown',
+                };
+                const reason = incompleteDetails.reason || 'unknown';
+                const usage = data.response?.usage;
+                const normalizedUsage = usage ? normalizeOpenAIResponsesUsage(usage) : undefined;
+                controller.enqueue({
+                  id: responseId || data.response?.id || '',
+                  model: responseModel || data.response?.model || '',
+                  created: Math.floor(Date.now() / 1000),
+                  event: 'error',
+                  delta: {},
+                  // 'content_filter' keeps its own finish reason; everything
+                  // else (max_output_tokens, unknown/absent reasons) maps to
+                  // 'length' — the same OpenAI-compatible default as
+                  // usage-logging's raw-mode incomplete mapping — so every
+                  // incomplete chunk carries a recognizable non-fatal finish
+                  // for the chat-facing formatters.
+                  finish_reason: reason === 'content_filter' ? 'content_filter' : 'length',
+                  incomplete_details: incompleteDetails,
+                  error: {
+                    statusCode: 500,
+                    code: reason,
+                    message: `Response ended incomplete: ${reason}`,
+                  },
+                  ...(normalizedUsage ? { usage: normalizedUsage } : {}),
+                });
+              } else if (data.type === 'error') {
+                // Generic Responses API stream error event (top-level, not
+                // nested under `response`) — no incomplete_details, since
+                // this is a hard stream-level error, not an "ended
+                // incomplete" signal.
+                controller.enqueue({
+                  id: responseId,
+                  model: responseModel,
+                  created: Math.floor(Date.now() / 1000),
+                  event: 'error',
+                  delta: {},
+                  error: {
+                    statusCode: 500,
+                    code: data.code || 'error',
+                    message: data.message || 'Upstream error',
+                  },
+                });
               }
             } catch (e) {
               logger.error('Error parsing Responses API streaming chunk', e);
@@ -1330,12 +1421,20 @@ export class ResponsesTransformer implements Transformer {
       });
     };
 
-    const finalizeOutputItems = (controller: ReadableStreamDefaultController): any[] => {
+    // `itemStatus` is the terminal status stamped on items that were still
+    // in progress when the stream ended. The completed and failed paths keep
+    // the pre-existing 'completed' stamp; only the response.incomplete path
+    // passes 'incomplete' (matching the real Responses API, where items cut
+    // off mid-generation surface as status 'incomplete').
+    const finalizeOutputItems = (
+      controller: ReadableStreamDefaultController,
+      itemStatus: 'completed' | 'incomplete' = 'completed'
+    ): any[] => {
       if (reasoningItemSent && reasoningOutputIndex !== null) {
         const reasoningItem = {
           id: reasoningItemId,
           type: 'reasoning',
-          status: 'completed',
+          status: itemStatus,
           content: reasoningText
             ? [
                 {
@@ -1395,7 +1494,7 @@ export class ResponsesTransformer implements Transformer {
         const messageItem = {
           id: messageItemId,
           type: 'message',
-          status: 'completed',
+          status: itemStatus,
           role: 'assistant',
           content: [
             {
@@ -1445,7 +1544,7 @@ export class ResponsesTransformer implements Transformer {
           toolItem = {
             id: itemId,
             type: 'custom_tool_call',
-            status: 'completed',
+            status: itemStatus,
             call_id: callId,
             name: flatName,
             input: this.customToolInput(args),
@@ -1455,7 +1554,7 @@ export class ResponsesTransformer implements Transformer {
           toolItem = {
             id: itemId,
             type: 'function_call',
-            status: 'completed',
+            status: itemStatus,
             call_id: callId,
             name: namespaced ? namespaced.name : flatName,
             ...(namespaced ? { namespace: namespaced.namespace } : {}),
@@ -1474,6 +1573,24 @@ export class ResponsesTransformer implements Transformer {
         .sort(([a], [b]) => a - b)
         .map(([, item]) => item);
     };
+
+    const buildUsagePayload = (usage: any) =>
+      usage
+        ? {
+            input_tokens:
+              (usage.input_tokens || 0) +
+              (usage.cached_tokens || 0) +
+              (usage.cache_creation_tokens || 0),
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            input_tokens_details: {
+              cached_tokens: usage.cached_tokens || 0,
+            },
+            output_tokens_details: {
+              reasoning_tokens: usage.reasoning_tokens || 0,
+            },
+          }
+        : undefined;
 
     return new ReadableStream({
       async start(controller) {
@@ -1520,6 +1637,64 @@ export class ResponsesTransformer implements Transformer {
 
             ensureCreated(controller, unifiedChunk);
             ensureInProgress(controller);
+
+            if (unifiedChunk.event === 'error') {
+              // Upstream failed, ended incomplete, or reported a stream-level
+              // error (surfaced as a unified error chunk by transformStream).
+              // Emit the matching Responses-API terminal event instead of
+              // unconditionally completing, so the client sees the actual
+              // outcome rather than a phantom success:
+              //   - incomplete_details present -> response.incomplete (the
+              //     upstream ended the turn early — max_output_tokens /
+              //     content_filter — not a hard failure).
+              //   - otherwise -> response.failed (a genuine hard error),
+              //     exactly as before.
+              if (unifiedChunk.usage) {
+                lastUsage = unifiedChunk.usage;
+              }
+              // Items still in progress on the incomplete path finalize with
+              // status 'incomplete'; the failed path keeps the pre-existing
+              // 'completed' stamp (see finalizeOutputItems).
+              const outputItems = finalizeOutputItems(
+                controller,
+                unifiedChunk.incomplete_details ? 'incomplete' : 'completed'
+              );
+              const err = unifiedChunk.error || {};
+
+              if (unifiedChunk.incomplete_details) {
+                sendEvent(controller, {
+                  type: 'response.incomplete',
+                  response: {
+                    id: responseId || undefined,
+                    object: 'response',
+                    created_at: responseCreatedAt || Math.floor(Date.now() / 1000),
+                    status: 'incomplete',
+                    model: responseModel,
+                    output: outputItems,
+                    incomplete_details: unifiedChunk.incomplete_details,
+                    usage: buildUsagePayload(lastUsage),
+                  },
+                });
+              } else {
+                sendEvent(controller, {
+                  type: 'response.failed',
+                  response: {
+                    id: responseId || undefined,
+                    object: 'response',
+                    created_at: responseCreatedAt || Math.floor(Date.now() / 1000),
+                    status: 'failed',
+                    model: responseModel,
+                    output: outputItems,
+                    error: {
+                      code: err.code || 'server_error',
+                      message: err.message || 'The model response failed to complete.',
+                    },
+                    usage: buildUsagePayload(lastUsage),
+                  },
+                });
+              }
+              break;
+            }
 
             if (unifiedChunk.usage) {
               lastUsage = unifiedChunk.usage;

@@ -8,6 +8,14 @@ const MAX_DEBUG_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB
 export class DebugLoggingInspector extends BaseInspector {
   private debugManager = DebugManager.getInstance();
   private mode: 'raw' | 'transformed';
+  // Capture state lives on the INSTANCE (not in createInspector closures) so
+  // finalize() can run the reconstruction from outside the stream lifecycle —
+  // see finalize() below for why that matters on cancellations.
+  private providerApiType: string = 'unknown';
+  private bodyChunks: string[] = [];
+  private totalSize = 0;
+  private truncated = false;
+  private finalized = false;
 
   constructor(requestId: string, mode: 'raw' | 'transformed' = 'raw') {
     super(requestId);
@@ -15,91 +23,123 @@ export class DebugLoggingInspector extends BaseInspector {
   }
 
   createInspector(providerApiType: string): PassThrough {
-    const inspector =
-      providerApiType === 'oauth' ? new PassThrough({ objectMode: true }) : new PassThrough();
+    this.providerApiType = providerApiType;
 
-    const bodyChunks: string[] = [];
-    let totalSize = 0;
-    let truncated = false;
-
-    inspector.on('data', (chunk: any) => {
-      logger.silly(
-        `[Inspector:${this.mode}] Request ${this.requestId} received chunk, length: ${chunk.length || chunk.toString().length}: ${chunk.toString()}`
-      );
-
-      if (truncated) return;
-
-      let chunkStr: string;
-      if (typeof chunk === 'string') {
-        chunkStr = chunk;
-      } else if (Buffer.isBuffer(chunk)) {
-        chunkStr = chunk.toString('utf8');
-      } else if (chunk instanceof Uint8Array) {
-        chunkStr = new TextDecoder().decode(chunk);
-      } else if (chunk && typeof chunk === 'object') {
-        chunkStr = `${JSON.stringify(chunk)}\n`;
-      } else {
-        try {
-          chunkStr = String(chunk);
-        } catch (e) {
-          logger.warn(`[${this.mode}] Failed to convert chunk to string`);
-          return;
-        }
-      }
-
-      const newSize = totalSize + chunkStr.length;
-
-      if (newSize > MAX_DEBUG_BUFFER_SIZE) {
-        truncated = true;
-        bodyChunks.push('\n\n[DEBUG OUTPUT TRUNCATED - Exceeded 10MB limit]');
-        logger.warn(`Request ${this.requestId} debug output truncated at ${totalSize} bytes`);
-        return;
-      }
-
-      totalSize = newSize;
-      bodyChunks.push(chunkStr);
+    // Capture happens synchronously in the transform hook (i.e. at write()
+    // time), NOT in a 'data' listener: 'data' emission for the very first
+    // writes is deferred to the tick after resume() starts the flow, so a
+    // teardown-time finalize() could miss bytes that were already written.
+    // With write-time capture, finalize() deterministically sees every chunk
+    // written up to the instant it runs.
+    const inspector = new PassThrough({
+      ...(providerApiType === 'oauth' ? { objectMode: true } : {}),
+      transform: (chunk: any, _encoding, callback) => {
+        this.captureChunk(chunk);
+        callback(null, chunk);
+      },
     });
 
-    inspector.on('end', () => {
-      const rawBody = bodyChunks.join('');
-      logger.silly(
-        `[Inspector:${this.mode}] Request ${this.requestId} stream ended, captured ${bodyChunks.length} chunks, total size: ${rawBody.length} bytes`
-      );
-      try {
-        let reconstructed: any = null;
-        switch (providerApiType) {
-          case 'chat':
-            reconstructed = this.reconstructChatCompletions(rawBody);
-            break;
-          case 'responses':
-            reconstructed = this.reconstructResponses(rawBody);
-            break;
-          case 'messages':
-            reconstructed = this.reconstructMessages(rawBody);
-            break;
-          case 'gemini':
-            reconstructed = this.reconstructGemini(rawBody);
-            break;
-          case 'oauth':
-            reconstructed = this.reconstructOAuth(rawBody);
-            break;
-          case 'unknown':
-            break;
-          default:
-            logger.warn(`Unknown providerApiType: ${providerApiType}`);
-        }
-        // Always save to memory for usage extraction/estimation
-        this.saveReconstructedResponse(reconstructed);
+    // Nothing external ever reads this tap's readable side — keep it flowing
+    // (into zero listeners) so pushed chunks never accumulate to the
+    // high-water mark and stall the transform hook above.
+    inspector.resume();
 
-        // DebugManager applies global/key/alias/provider capture policy.
-        this.saveRawResponse(rawBody);
-      } catch (err) {
-        logger.error(`[Inspector:${this.mode}] Reconstruction failed: ${err}`);
-        this.saveRawResponse(rawBody);
-      }
-    });
+    inspector.on('end', () => this.finalize());
 
     return inspector;
+  }
+
+  private captureChunk(chunk: any): void {
+    logger.silly(
+      `[Inspector:${this.mode}] Request ${this.requestId} received chunk, length: ${chunk.length || chunk.toString().length}: ${chunk.toString()}`
+    );
+
+    if (this.truncated) return;
+
+    let chunkStr: string;
+    if (typeof chunk === 'string') {
+      chunkStr = chunk;
+    } else if (Buffer.isBuffer(chunk)) {
+      chunkStr = chunk.toString('utf8');
+    } else if (chunk instanceof Uint8Array) {
+      chunkStr = new TextDecoder().decode(chunk);
+    } else if (chunk && typeof chunk === 'object') {
+      chunkStr = `${JSON.stringify(chunk)}\n`;
+    } else {
+      try {
+        chunkStr = String(chunk);
+      } catch (e) {
+        logger.warn(`[${this.mode}] Failed to convert chunk to string`);
+        return;
+      }
+    }
+
+    const newSize = this.totalSize + chunkStr.length;
+
+    if (newSize > MAX_DEBUG_BUFFER_SIZE) {
+      this.truncated = true;
+      this.bodyChunks.push('\n\n[DEBUG OUTPUT TRUNCATED - Exceeded 10MB limit]');
+      logger.warn(`Request ${this.requestId} debug output truncated at ${this.totalSize} bytes`);
+      return;
+    }
+
+    this.totalSize = newSize;
+    this.bodyChunks.push(chunkStr);
+  }
+
+  /**
+   * Reconstructs and persists everything captured so far (snapshot to memory
+   * always; raw body per capture policy). One-shot: the stream's natural
+   * 'end' event and any explicit teardown call share the same guard, so
+   * whichever runs first wins and later calls are no-ops.
+   *
+   * PUBLIC because stream flush is not guaranteed to run: a client
+   * disconnect/timeout cancels the web TransformStream pipeline WITHOUT
+   * running its flush, so this tap's 'end' never fires — response-handler's
+   * cancellation teardown calls finalize() explicitly BEFORE destroying the
+   * usage inspector, so UsageInspector._destroy's snapshot fallback reads a
+   * live capture instead of nothing.
+   */
+  finalize(): void {
+    if (this.finalized) return;
+    this.finalized = true;
+
+    const rawBody = this.bodyChunks.join('');
+    logger.silly(
+      `[Inspector:${this.mode}] Request ${this.requestId} capture finalized, captured ${this.bodyChunks.length} chunks, total size: ${rawBody.length} bytes`
+    );
+    try {
+      let reconstructed: any = null;
+      switch (this.providerApiType) {
+        case 'chat':
+          reconstructed = this.reconstructChatCompletions(rawBody);
+          break;
+        case 'responses':
+          reconstructed = this.reconstructResponses(rawBody);
+          break;
+        case 'messages':
+          reconstructed = this.reconstructMessages(rawBody);
+          break;
+        case 'gemini':
+          reconstructed = this.reconstructGemini(rawBody);
+          break;
+        case 'oauth':
+          reconstructed = this.reconstructOAuth(rawBody);
+          break;
+        case 'unknown':
+          break;
+        default:
+          logger.warn(`Unknown providerApiType: ${this.providerApiType}`);
+      }
+      // Always save to memory for usage extraction/estimation
+      this.saveReconstructedResponse(reconstructed);
+
+      // DebugManager applies global/key/alias/provider capture policy.
+      this.saveRawResponse(rawBody);
+    } catch (err) {
+      logger.error(`[Inspector:${this.mode}] Reconstruction failed: ${err}`);
+      this.saveRawResponse(rawBody);
+    }
   }
 
   private saveRawResponse(fullBody: string): void {
@@ -763,6 +803,29 @@ export class DebugLoggingInspector extends BaseInspector {
 
       case 'response.completed':
         // Final response state
+        if (event.response) {
+          Object.assign(acc, event.response);
+        }
+        break;
+
+      case 'response.failed':
+        // Upstream/client-facing hard failure. Same merge semantics as
+        // response.completed: absorb the final response object (status
+        // 'failed', error, and usage-if-present) so failed/truncated
+        // streams don't get stuck reporting a stale snapshot (usually
+        // 'in_progress') with zero usage.
+        if (event.response) {
+          Object.assign(acc, event.response);
+        }
+        break;
+
+      case 'response.incomplete':
+        // Upstream ended the response early (e.g. max_output_tokens or a
+        // content filter). Same merge semantics as response.completed /
+        // response.failed: absorb the final response object (status
+        // 'incomplete', incomplete_details, and usage-if-present) so
+        // truncated streams don't get stuck reporting a stale snapshot
+        // with zero usage.
         if (event.response) {
           Object.assign(acc, event.response);
         }
