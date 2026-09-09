@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { isOAuthPlaceholderUrl } from '@plexus/shared';
 import { useNavigate } from 'react-router-dom';
 import { api, Provider, OAuthSession, OAuthProviderInfo, fetchQuotaCheckers } from '../lib/api';
 import type { QuotaCheckerInfo } from '../types/quota';
@@ -36,8 +37,8 @@ const getOAuthCheckerType = (oauthProvider?: string): string | null => {
 const inferProviderTypes = (apiBaseUrl?: string | Record<string, string>): string[] => {
   if (!apiBaseUrl) return ['chat'];
   if (typeof apiBaseUrl === 'string') {
-    const url = apiBaseUrl.toLowerCase();
-    if (url.startsWith('oauth://')) return ['oauth'];
+    const url = apiBaseUrl.trim().toLowerCase();
+    if (isOAuthPlaceholderUrl(apiBaseUrl)) return ['oauth'];
     if (url.includes('anthropic.com')) return ['messages'];
     if (url.includes('generativelanguage.googleapis.com')) return ['gemini'];
     return ['chat'];
@@ -167,7 +168,7 @@ export function useProviderForm() {
   // Derived
   const isOAuthMode =
     typeof editingProvider.apiBaseUrl === 'string' &&
-    editingProvider.apiBaseUrl.toLowerCase().startsWith('oauth://');
+    isOAuthPlaceholderUrl(editingProvider.apiBaseUrl);
   const oauthCheckerType = isOAuthMode ? getOAuthCheckerType(editingProvider.oauthProvider) : null;
   const selectableQuotaCheckerTypes = oauthCheckerType
     ? [oauthCheckerType]
@@ -822,7 +823,7 @@ export function useProviderForm() {
             ? {
                 pricing,
                 type: 'image',
-                access_via: model.access_via ?? [CODEX_IMAGE_ACCESS],
+                access_via: model.access_via?.length ? model.access_via : [CODEX_IMAGE_ACCESS],
               }
             : { pricing, access_via: [] };
       }

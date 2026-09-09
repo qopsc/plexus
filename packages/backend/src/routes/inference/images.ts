@@ -1,3 +1,4 @@
+import { wireUpstreamTimeout, wireEarlyDisconnectDetection } from '../../utils/timeout';
 import { FastifyInstance } from 'fastify';
 import { logger } from '../../utils/logger';
 import { Dispatcher } from '../../services/dispatch/dispatcher';
@@ -137,6 +138,9 @@ export async function registerImagesRoute(
     reply.header('x-request-id', requestId);
     if (clientRequestId) reply.header(CLIENT_REQUEST_ID_HEADER, clientRequestId);
     const startTime = Date.now();
+    const abortController = new AbortController();
+    const { signal, resolveTimeoutMs } = wireUpstreamTimeout(abortController);
+    const disconnect = wireEarlyDisconnectDetection(request, abortController);
 
     let usageRecord: Partial<UsageRecord> = {
       requestId,
@@ -202,9 +206,13 @@ export async function registerImagesRoute(
         sanitizeHeaders(request.headers as any)
       );
 
-      const unifiedResponse = await dispatcher.dispatchImageGenerations(unifiedRequest);
+      const unifiedResponse = await dispatcher.dispatchImageGenerations(
+        unifiedRequest,
+        signal,
+        resolveTimeoutMs
+      );
       const clientResponse = isOpenRouterImageRoute
-        ? await formatOpenRouterImageResponse(unifiedResponse)
+        ? await formatOpenRouterImageResponse(unifiedResponse, signal)
         : unifiedResponse;
 
       // Emit 'updated' event with routing decision details
@@ -250,6 +258,11 @@ export async function registerImagesRoute(
 
       return reply.send(clientResponse);
     } catch (e: any) {
+      if (signal.aborted) {
+        e = Object.assign(new Error('Client disconnected'), {
+          routingContext: { ...e.routingContext, statusCode: 499, code: 'client_disconnected' },
+        });
+      }
       usageRecord.responseStatus = 'error';
       usageRecord.durationMs = Date.now() - startTime;
       usageRecord.attemptCount = e.routingContext?.attemptCount || usageRecord.attemptCount || 1;
@@ -273,6 +286,8 @@ export async function registerImagesRoute(
             e.routingContext?.code || (statusCode === 400 ? 'invalid_request_error' : 'api_error'),
         },
       });
+    } finally {
+      disconnect.cleanup();
     }
   };
 
@@ -290,6 +305,9 @@ export async function registerImagesRoute(
     reply.header('x-request-id', requestId);
     if (clientRequestId) reply.header(CLIENT_REQUEST_ID_HEADER, clientRequestId);
     const startTime = Date.now();
+    const abortController = new AbortController();
+    const { signal, resolveTimeoutMs } = wireUpstreamTimeout(abortController);
+    const disconnect = wireEarlyDisconnectDetection(request, abortController);
 
     let usageRecord: Partial<UsageRecord> = {
       requestId,
@@ -370,7 +388,11 @@ export async function registerImagesRoute(
         sanitizeHeaders(request.headers as any)
       );
 
-      const unifiedResponse = await dispatcher.dispatchImageGenerations(unifiedRequest);
+      const unifiedResponse = await dispatcher.dispatchImageGenerations(
+        unifiedRequest,
+        signal,
+        resolveTimeoutMs
+      );
 
       usageStorage.emitUpdatedAsync({
         requestId,
@@ -410,6 +432,11 @@ export async function registerImagesRoute(
 
       return reply.send(unifiedResponse);
     } catch (e: any) {
+      if (signal.aborted) {
+        e = Object.assign(new Error('Client disconnected'), {
+          routingContext: { ...e.routingContext, statusCode: 499, code: 'client_disconnected' },
+        });
+      }
       usageRecord.responseStatus = 'error';
       usageRecord.durationMs = Date.now() - startTime;
       usageRecord.attemptCount = e.routingContext?.attemptCount || usageRecord.attemptCount || 1;
@@ -433,6 +460,8 @@ export async function registerImagesRoute(
             e.routingContext?.code || (statusCode === 400 ? 'invalid_request_error' : 'api_error'),
         },
       });
+    } finally {
+      disconnect.cleanup();
     }
   });
 }

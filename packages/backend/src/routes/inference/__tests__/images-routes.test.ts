@@ -1,4 +1,5 @@
-import { describe, it, expect, vi } from 'vitest';
+import { setConfigForTesting } from '../../../config';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { FastifyInstance } from 'fastify';
 import { registerImagesRoute } from '../images';
 import { Dispatcher } from '../../../services/dispatch/dispatcher';
@@ -48,6 +49,89 @@ type FakeReply = {
 type EditsHandler = (request: FakeRequest, reply: FakeReply) => Promise<unknown>;
 
 describe('Images route telemetry', () => {
+  beforeEach(() => setConfigForTesting({ providers: {}, models: {}, keys: {} } as any));
+  afterEach(() => vi.useRealTimers());
+
+  it.each(['/v1/images/generations', '/v1/images/edits'])(
+    'cancels pending dispatch and cleans disconnect polling for %s',
+    async (path) => {
+      vi.useFakeTimers();
+      let handler!: (request: any, reply: any) => Promise<unknown>;
+      const fastify = {
+        post: (registeredPath: string, callback: typeof handler) => {
+          if (registeredPath === path) handler = callback;
+        },
+      } as unknown as FastifyInstance;
+      let started!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const dispatchImageGenerations = vi.fn(
+        (_request: UnifiedImageGenerationRequest, signal: AbortSignal) => {
+          started();
+          return new Promise((_, reject) =>
+            signal.addEventListener(
+              'abort',
+              () =>
+                reject(
+                  Object.assign(new Error('Client disconnected'), {
+                    routingContext: { statusCode: 499 },
+                  })
+                ),
+              { once: true }
+            )
+          );
+        }
+      );
+      const storage = {
+        emitStartedAsync: vi.fn(),
+        emitUpdatedAsync: vi.fn(),
+        saveRequest: vi.fn(),
+        saveError: vi.fn(),
+      } as unknown as UsageStorageService;
+      await registerImagesRoute(
+        fastify,
+        { dispatchImageGenerations } as unknown as Dispatcher,
+        storage
+      );
+      const handle = { closed: false };
+      const body = path.endsWith('/edits')
+        ? {
+            image: {
+              type: 'file',
+              fieldname: 'image',
+              filename: 'image.png',
+              mimetype: 'image/png',
+              toBuffer: async () => Buffer.from('image'),
+            },
+            model: { type: 'field', fieldname: 'model', value: 'images' },
+            prompt: { type: 'field', fieldname: 'prompt', value: 'a fox' },
+          }
+        : { model: 'images', prompt: 'a fox' };
+      const reply: FakeReply = {
+        header: vi.fn(() => reply),
+        code: vi.fn(() => reply),
+        send: vi.fn(),
+      };
+      const result = handler(
+        {
+          headers: {},
+          ip: '127.0.0.1',
+          body,
+          raw: { socket: { [Symbol('handle')]: handle } },
+          isMultipart: () => true,
+        },
+        reply
+      );
+      await ready;
+      handle.closed = true;
+      await vi.advanceTimersByTimeAsync(250);
+      await result;
+      expect(dispatchImageGenerations.mock.calls[0]![1].aborted).toBe(true);
+      expect(reply.code).toHaveBeenCalledWith(499);
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  );
   it('returns promptly even when saveRequest is unresolved for /v1/images/edits', async () => {
     let editsHandler: EditsHandler | undefined;
 

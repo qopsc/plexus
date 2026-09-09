@@ -45,7 +45,9 @@ export interface RequestManagerHost {
   createAttemptTimeout(...args: any[]): any;
   /** Image pipeline entry point, used by the image-model auto-bridge. */
   dispatchImageGenerations(
-    request: UnifiedImageGenerationRequest
+    request: UnifiedImageGenerationRequest,
+    signal?: AbortSignal,
+    resolveTimeoutMs?: ResolveTimeoutMs
   ): Promise<UnifiedImageGenerationResponse>;
   emitRoutingUpdate(...args: any[]): void;
   executeProviderRequest(...args: any[]): Promise<Response>;
@@ -102,7 +104,7 @@ export class RequestManager {
     // detection needs resolved candidates (aliases, `direct/`, key policy,
     // quota already applied) and nothing target-specific has run yet.
     if (isImageModelRoute(request, candidates, config)) {
-      return bridgeChatToImageGeneration(request, candidates, host);
+      return bridgeChatToImageGeneration(request, candidates, host, signal, resolveTimeoutMs);
     }
 
     const targets = failoverEnabled ? candidates : [candidates[0]!];

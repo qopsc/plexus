@@ -1,3 +1,4 @@
+import type { ResolveTimeoutMs } from './upstream-execution';
 /**
  * Auto-bridge: a CHAT-SHAPED request that names an IMAGE-TYPE model.
  *
@@ -58,7 +59,9 @@ import type {
  */
 export interface ImageBridgeHost {
   dispatchImageGenerations(
-    request: UnifiedImageGenerationRequest
+    request: UnifiedImageGenerationRequest,
+    signal?: AbortSignal,
+    resolveTimeoutMs?: ResolveTimeoutMs
   ): Promise<UnifiedImageGenerationResponse>;
 }
 
@@ -349,7 +352,9 @@ export async function synthesizeChatStream(
 export async function bridgeChatToImageGeneration(
   request: UnifiedChatRequest,
   candidates: RouteResult[],
-  host: ImageBridgeHost
+  host: ImageBridgeHost,
+  signal?: AbortSignal,
+  resolveTimeoutMs?: ResolveTimeoutMs
 ): Promise<UnifiedChatResponse> {
   const imageRequest = buildImageRequestFromChat(request);
   logger.info(
@@ -358,7 +363,7 @@ export async function bridgeChatToImageGeneration(
       `(${candidates.length} candidate${candidates.length === 1 ? '' : 's'})`
   );
 
-  const imageResponse = await host.dispatchImageGenerations(imageRequest);
+  const imageResponse = await host.dispatchImageGenerations(imageRequest, signal, resolveTimeoutMs);
 
   return request.stream
     ? synthesizeChatStream(imageResponse, request)

@@ -30,6 +30,7 @@ import type { UsageRecord } from '../../types/usage';
 const TINY_IMAGE_B64 = 'aGVsbG8=';
 
 const mockStorage = {
+  trackFinalization: <T>(task: Promise<T>) => task,
   saveRequest: vi.fn(),
   saveError: vi.fn(),
   updatePerformanceMetrics: vi.fn(),

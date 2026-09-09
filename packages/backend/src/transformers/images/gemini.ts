@@ -30,9 +30,10 @@ function resolutionFromSize(size: string): ImageResolution | undefined {
 }
 
 async function imagePartFromReference(
-  reference: NonNullable<UnifiedImageGenerationRequest['input_references']>[number]
+  reference: NonNullable<UnifiedImageGenerationRequest['input_references']>[number],
+  signal?: AbortSignal
 ): Promise<any> {
-  const resolved = await resolveImageReference(reference);
+  const resolved = await resolveImageReference(reference, signal);
 
   return {
     inlineData: {
@@ -85,12 +86,15 @@ export class GeminiImageTransformer implements ImageGenerationTransformer {
     headers['x-goog-api-key'] = apiKey;
   }
 
-  async transformGenerationRequest(request: UnifiedImageGenerationRequest): Promise<any> {
+  async transformGenerationRequest(
+    request: UnifiedImageGenerationRequest,
+    signal?: AbortSignal
+  ): Promise<any> {
     unsupportedOptions(request);
 
     const parts: any[] = [{ text: request.prompt }];
     for (const reference of request.input_references ?? []) {
-      parts.push(await imagePartFromReference(reference));
+      parts.push(await imagePartFromReference(reference, signal));
     }
 
     const resolution =

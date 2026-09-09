@@ -1,4 +1,5 @@
 import { formatNumber, formatPoints } from './format';
+import { isOAuthPlaceholderUrl } from '@plexus/shared';
 import { normalizeApiAccessList } from './apiFormats';
 import { dedupeAliasTargets, dedupeById, dedupeModels, dedupeStrings } from './modelOptions';
 
@@ -20,9 +21,9 @@ function inferProviderTypes(apiBaseUrl?: string | Record<string, string>): strin
 
   if (typeof apiBaseUrl === 'string') {
     // Single URL - infer type from URL pattern
-    const url = apiBaseUrl.toLowerCase();
+    const url = apiBaseUrl.trim().toLowerCase();
 
-    if (url.startsWith('oauth://')) {
+    if (isOAuthPlaceholderUrl(apiBaseUrl)) {
       return ['oauth'];
     }
 

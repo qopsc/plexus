@@ -457,6 +457,17 @@ describe('bridgeChatToImageGeneration', () => {
     expect(response.image_generation_calls).toHaveLength(1);
   });
 
+  test('forwards caller cancellation and provider deadline resolution', async () => {
+    const signal = new AbortController().signal;
+    const resolveTimeoutMs = () => 1234;
+    await bridgeChatToImageGeneration(chatRequest(), [candidate()], host, signal, resolveTimeoutMs);
+    expect(dispatchImageGenerations).toHaveBeenCalledWith(
+      expect.any(Object),
+      signal,
+      resolveTimeoutMs
+    );
+  });
+
   test('synthesizes a stream when the chat request asked for one', async () => {
     const response = await bridgeChatToImageGeneration(
       chatRequest({ stream: true }),

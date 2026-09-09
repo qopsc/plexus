@@ -6,7 +6,7 @@ import { applyModelBehaviors } from '../models/model-behaviors';
 import type { RouteResult } from '../routing/router';
 import type { ResolvedAdapter } from '../../types/provider-adapter';
 import { applyGeminiThinkingConfig, getApiMetadata } from '../providers/provider-api-selection';
-import { isClaudeMaskingApiKeyRoute, isPiAiRoute } from '../oauth/oauth-dispatcher';
+import { isClaudeMaskingApiKeyRoute, isOAuthRoute, isPiAiRoute } from '../oauth/oauth-dispatcher';
 import {
   isCodexCliShapedBody,
   isNativeOAuthProvider,
@@ -32,18 +32,9 @@ export const NATIVE_OAUTH_STASH = Symbol('nativeOAuthPrep');
  */
 export function isNativeOAuthRoute(route: RouteResult, targetApiType: string): boolean {
   if (isClaudeMaskingApiKeyRoute(route, targetApiType)) return true;
-  if (!isOAuthRouteForNative(route, targetApiType)) return false;
+  if (!isOAuthRoute(route, targetApiType)) return false;
   const provider = route.config.oauth_provider || route.provider;
   return isNativeOAuthProvider(provider);
-}
-
-function isOAuthRouteForNative(route: RouteResult, targetApiType: string): boolean {
-  if (targetApiType.toLowerCase() === 'oauth') return true;
-  if (typeof route.config.api_base_url === 'string') {
-    return route.config.api_base_url.startsWith('oauth://');
-  }
-  const urlMap = route.config.api_base_url as Record<string, string>;
-  return Object.values(urlMap).some((value) => value.startsWith('oauth://'));
 }
 
 export interface RequestPayload {

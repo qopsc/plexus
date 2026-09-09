@@ -24,11 +24,30 @@ import { prepareCodexImagesDispatch } from '../oauth/oauth-native-request';
 import { getApiBaseType } from '../../utils/api-format';
 import type { ImageGenerationTransformer } from '../../types/image-transformer';
 import type { RetryAttemptRecord } from './dispatcher-types';
+import {
+  createAttemptTimeout,
+  type AttemptTimeout,
+  type ResolveTimeoutMs,
+} from './upstream-execution';
+import { admitProvider } from '../runtime/provider-admission';
 
 function imageRoutingError(message: string): Error {
   const error = new Error(message) as any;
   error.routingContext = { statusCode: 400, code: 'invalid_request_error' };
   return error;
+}
+
+/** Stop this attempt's wait without cancelling credential work shared by other requests. */
+function waitForImageSetup<T>(setup: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    setup.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
 }
 
 /**
@@ -45,7 +64,8 @@ function imageRoutingError(message: string): Error {
 async function resolveImageDispatchTarget(
   route: RouteResult,
   targetApiType: string,
-  transformer: ImageGenerationTransformer
+  transformer: ImageGenerationTransformer,
+  signal: AbortSignal
 ): Promise<{ baseUrl: string; headers: Record<string, string> }> {
   const headers: Record<string, string> = { Accept: 'application/json' };
   let baseUrl: string;
@@ -57,10 +77,13 @@ async function resolveImageDispatchTarget(
         `OAuth provider ${oauthProvider} cannot serve image target ${targetApiType}`
       );
     }
-    const prepared = await prepareCodexImagesDispatch({
-      modelId: route.model,
-      oauthAccountId: route.config.oauth_account?.trim(),
-    });
+    const prepared = await waitForImageSetup(
+      prepareCodexImagesDispatch({
+        modelId: route.model,
+        oauthAccountId: route.config.oauth_account?.trim(),
+      }),
+      signal
+    );
     baseUrl = prepared.baseUrl;
     Object.assign(headers, prepared.headers);
   } else {
@@ -234,6 +257,8 @@ function providerImageOptions(
 }
 
 interface MediaDispatchHost {
+  buildCancelledError(signal: AbortSignal): Error;
+  buildTimeoutError(): Error;
   resolveBaseUrl(route: RouteResult, apiType: string): string;
   executeProviderRequest(
     url: string,
@@ -1079,9 +1104,12 @@ export class MediaDispatcher {
    * Handles JSON body requests to OpenAI-compatible image generation endpoints
    */
   async dispatchImageGenerations(
-    request: UnifiedImageGenerationRequest
+    request: UnifiedImageGenerationRequest,
+    signal?: AbortSignal,
+    resolveTimeoutMs?: ResolveTimeoutMs
   ): Promise<UnifiedImageGenerationResponse> {
     const host = this.host;
+    if (signal?.aborted) throw host.buildCancelledError(signal);
 
     const config = getConfig();
     const failover = config.failover;
@@ -1107,63 +1135,37 @@ export class MediaDispatcher {
     for (let i = 0; i < targets.length; i++) {
       const route = targets[i]!;
 
-      // Re-check cooldown status before attempting this target
-      const isHealthy = await CooldownManager.getInstance().isProviderHealthy(
-        route.provider,
-        route.model
-      );
-      if (!isHealthy) {
-        logger.warn(`Skipping ${route.provider}/${route.model} - provider is on cooldown`);
-        lastError = new Error(`Provider ${route.provider}/${route.model} is on cooldown`);
-        host.appendSkippedAttempt(
-          retryHistory,
-          route,
-          `Provider ${route.provider}/${route.model} is on cooldown`,
-          'images'
-        );
-        continue;
-      }
-
-      // Acquire concurrency slot before upstream request
-      const acquired = ConcurrencyTracker.getInstance().acquire(route.provider, route.model);
-      if (!acquired) {
-        logger.warn(`Skipping ${route.provider}/${route.model} - concurrency limit exceeded`);
-        lastError = new Error(
-          `Provider ${route.provider}/${route.model} concurrency limit exceeded`
-        );
-        host.appendSkippedAttempt(
-          retryHistory,
-          route,
-          `Provider ${route.provider}/${route.model} concurrency limit exceeded`,
-          'images'
-        );
+      if (signal?.aborted) throw host.buildCancelledError(signal);
+      const admission = await admitProvider(route);
+      if (!admission.admitted) {
+        lastError = new Error(admission.reason);
+        host.appendSkippedAttempt(retryHistory, route, admission.reason, 'images');
         continue;
       }
 
       attemptedProviders.push(`${route.provider}/${route.model}`);
-
-      let released = false;
-      const doRelease = () => {
-        if (!released) {
-          released = true;
-          ConcurrencyTracker.getInstance().release(route.provider, route.model);
-        }
-      };
-
-      host.emitRoutingUpdate(request.requestId, route);
-
+      let attemptTimeout: AttemptTimeout | undefined;
       try {
+        attemptTimeout = createAttemptTimeout(signal, route.config.timeoutMs, resolveTimeoutMs);
+        attemptTimeout.signal.throwIfAborted();
+        host.emitRoutingUpdate(request.requestId, route);
         const targetApiType = selectTargetApiType(route, 'images').targetApiType || 'chat';
         const transformer = ImageGenerationTransformerFactory.resolveTransformer(targetApiType);
         const requestWithModel = { ...request, model: route.model };
         const { baseUrl, headers } = await resolveImageDispatchTarget(
           route,
           targetApiType,
-          transformer
+          transformer,
+          attemptTimeout.signal
         );
         const url = `${baseUrl}${transformer.getEndpoint(requestWithModel)}`;
 
-        let payload = await transformer.transformGenerationRequest(requestWithModel);
+        attemptTimeout.signal.throwIfAborted();
+        let payload = await transformer.transformGenerationRequest(
+          requestWithModel,
+          attemptTimeout.signal
+        );
+        attemptTimeout.signal.throwIfAborted();
         payload = mergeImagePayload(payload, route.config.extraBody);
         payload = mergeImagePayload(payload, route.modelConfig?.extraBody);
 
@@ -1190,6 +1192,7 @@ export class MediaDispatcher {
 
         const response = await fetch(url, {
           method: 'POST',
+          signal: attemptTimeout.signal,
           headers,
           body: payload instanceof FormData ? payload : JSON.stringify(payload),
         });
@@ -1214,46 +1217,20 @@ export class MediaDispatcher {
 
         if (!response.ok) {
           const errorText = await response.text();
-          const canRetry =
-            failoverEnabled &&
-            i < targets.length - 1 &&
-            host.isRetryableStatus(response.status, failover?.retryableStatusCodes || []);
-
-          try {
-            await host.handleProviderError(
-              response,
-              route,
-              errorText,
-              url,
-              headers,
-              'images',
-              request.requestId
-            );
-          } catch (e: any) {
-            lastError = e;
-            host.appendFailureAttempt(retryHistory, route, e, 'images', canRetry);
-            if (canRetry) {
-              await host.recordAttemptMetric(route, request.requestId, false);
-              // Only mark as failed if cooldown was actually triggered (not a caller error)
-              if (e?.routingContext?.cooldownTriggered) {
-                CooldownManager.getInstance().markProviderFailure(
-                  route.provider,
-                  route.model,
-                  undefined,
-                  host.formatFailureReason(e, true)
-                );
-              }
-              host.saveIntermediateError(request.requestId, 'images', e);
-              logger.warn(
-                `Failover: retrying image generation after HTTP ${response.status} from ${route.provider}/${route.model}`
-              );
-              continue;
-            }
-            throw e;
-          }
+          attemptTimeout.signal.throwIfAborted();
+          await host.handleProviderError(
+            response,
+            route,
+            errorText,
+            url,
+            headers,
+            'images',
+            request.requestId
+          );
         }
 
         const responseBody = await response.json();
+        attemptTimeout.signal.throwIfAborted();
         logger.silly('Image Generation Response', responseBody);
 
         if (request.requestId) {
@@ -1265,6 +1242,7 @@ export class MediaDispatcher {
           requestWithModel
         );
 
+        attemptTimeout.signal.throwIfAborted();
         unifiedResponse.plexus = {
           provider: route.provider,
           model: route.model,
@@ -1285,14 +1263,14 @@ export class MediaDispatcher {
           route,
           'images'
         );
-        doRelease();
         return unifiedResponse;
-      } catch (error: any) {
+      } catch (caught: any) {
+        if (signal?.aborted) throw host.buildCancelledError(signal);
+        const error = attemptTimeout?.isTimedOut() ? host.buildTimeoutError() : caught;
         lastError = error;
-        doRelease();
         // handleProviderError already called markProviderFailure for HTTP errors.
         // Only call it here for pure network/transport errors (no statusCode).
-        if (error?.routingContext?.statusCode === undefined) {
+        if (attemptTimeout?.isTimedOut() || error?.routingContext?.statusCode === undefined) {
           CooldownManager.getInstance().markProviderFailure(
             route.provider,
             route.model,
@@ -1302,22 +1280,30 @@ export class MediaDispatcher {
         }
         await host.recordAttemptMetric(route, request.requestId, false);
 
-        const canRetryNetwork =
+        const canRetry =
           failoverEnabled &&
           i < targets.length - 1 &&
-          host.isRetryableNetworkError(error, failover?.retryableErrors || []);
+          (error?.routingContext?.statusCode !== undefined
+            ? host.isRetryableStatus(
+                error.routingContext.statusCode,
+                failover?.retryableStatusCodes || []
+              )
+            : host.isRetryableNetworkError(error, failover?.retryableErrors || []));
 
-        host.appendFailureAttempt(retryHistory, route, error, 'images', canRetryNetwork);
+        host.appendFailureAttempt(retryHistory, route, error, 'images', canRetry);
 
-        if (canRetryNetwork) {
+        if (canRetry) {
           host.saveIntermediateError(request.requestId, 'images', error);
           logger.warn(
-            `Failover: retrying image generation after network/transport error from ${route.provider}/${route.model}: ${error.message}`
+            `Failover: retrying image generation after failure from ${route.provider}/${route.model}: ${error.message}`
           );
           continue;
         }
 
         throw host.buildAllTargetsFailedError(lastError, attemptedProviders, retryHistory);
+      } finally {
+        attemptTimeout?.cleanup();
+        admission.release();
       }
     }
 

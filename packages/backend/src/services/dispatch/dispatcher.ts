@@ -113,6 +113,8 @@ export class Dispatcher {
   private getMediaDispatcher(): MediaDispatcher {
     if (!this.mediaDispatcher) {
       this.mediaDispatcher = new MediaDispatcher({
+        buildCancelledError: this.buildCancelledError.bind(this),
+        buildTimeoutError: this.buildTimeoutError.bind(this),
         resolveBaseUrl: this.resolveBaseUrl.bind(this),
         executeProviderRequest: this.executeProviderRequest.bind(this),
         handleProviderError: this.handleProviderError.bind(this),
@@ -1058,9 +1060,11 @@ export class Dispatcher {
   }
 
   async dispatchImageGenerations(
-    request: UnifiedImageGenerationRequest
+    request: UnifiedImageGenerationRequest,
+    signal?: AbortSignal,
+    resolveTimeoutMs?: ResolveTimeoutMs
   ): Promise<UnifiedImageGenerationResponse> {
-    return this.getMediaDispatcher().dispatchImageGenerations(request);
+    return this.getMediaDispatcher().dispatchImageGenerations(request, signal, resolveTimeoutMs);
   }
 
   /**
@@ -1068,9 +1072,15 @@ export class Dispatcher {
    * `UnifiedImageGenerationRequest` (upload as `input_references[0]`, optional
    * inpainting mask as `mask`) and call `dispatchImageGenerations` instead.
    */
-  async dispatchImageEdits(request: UnifiedImageEditRequest): Promise<UnifiedImageEditResponse> {
+  async dispatchImageEdits(
+    request: UnifiedImageEditRequest,
+    signal?: AbortSignal,
+    resolveTimeoutMs?: ResolveTimeoutMs
+  ): Promise<UnifiedImageEditResponse> {
     return this.getMediaDispatcher().dispatchImageGenerations(
-      editRequestToGenerationRequest(request)
+      editRequestToGenerationRequest(request),
+      signal,
+      resolveTimeoutMs
     );
   }
 }

@@ -95,8 +95,11 @@ function rejectUnsupportedOptions(request: UnifiedImageGenerationRequest): void 
   }
 }
 
-async function referenceToDataUrl(reference: UnifiedImageReference): Promise<string> {
-  const resolved = await resolveImageReference(reference);
+async function referenceToDataUrl(
+  reference: UnifiedImageReference,
+  signal?: AbortSignal
+): Promise<string> {
+  const resolved = await resolveImageReference(reference, signal);
   return `data:${resolved.mimeType};base64,${resolved.data.toString('base64')}`;
 }
 
@@ -118,7 +121,8 @@ function buildCodexGenerationRequest(
 }
 
 async function buildCodexEditRequest(
-  request: UnifiedImageGenerationRequest
+  request: UnifiedImageGenerationRequest,
+  signal?: AbortSignal
 ): Promise<Record<string, unknown>> {
   const references = request.input_references ?? [];
   if (references.length > MAX_CODEX_IMAGE_REFERENCES) {
@@ -130,7 +134,7 @@ async function buildCodexEditRequest(
   const size = resolveCodexSize(request);
   const images: Array<{ image_url: string }> = [];
   for (const reference of references) {
-    images.push({ image_url: await referenceToDataUrl(reference) });
+    images.push({ image_url: await referenceToDataUrl(reference, signal) });
   }
 
   const payload: Record<string, unknown> = {
@@ -163,11 +167,14 @@ export class CodexImageTransformer implements ImageGenerationTransformer {
       : this.defaultEndpoint;
   }
 
-  async transformGenerationRequest(request: UnifiedImageGenerationRequest): Promise<any> {
+  async transformGenerationRequest(
+    request: UnifiedImageGenerationRequest,
+    signal?: AbortSignal
+  ): Promise<any> {
     rejectUnsupportedOptions(request);
 
     if (request.input_references && request.input_references.length > 0) {
-      return buildCodexEditRequest(request);
+      return buildCodexEditRequest(request, signal);
     }
     return buildCodexGenerationRequest(request);
   }

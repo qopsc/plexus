@@ -105,8 +105,10 @@ function isUnsafeRemoteImageHost(hostname: string): boolean {
 }
 
 export async function resolveImageReference(
-  reference: UnifiedImageReference
+  reference: UnifiedImageReference,
+  signal?: AbortSignal
 ): Promise<{ mimeType: string; data: Buffer }> {
+  signal?.throwIfAborted();
   const inline = parseImageDataUrl(reference.image_url.url);
   if (inline) return inline;
 
@@ -129,7 +131,7 @@ export async function resolveImageReference(
     const response = await fetch(url, {
       redirect: 'error',
       headers: { Accept: 'image/*' },
-      signal: controller.signal,
+      signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
     });
     if (!response.ok) {
       throw new ImageRequestValidationError(`Image reference URL returned HTTP ${response.status}`);
@@ -152,6 +154,7 @@ export async function resolveImageReference(
     }
     return { mimeType, data };
   } catch (error) {
+    signal?.throwIfAborted();
     if (error instanceof ImageRequestValidationError) throw error;
     if ((error as any)?.name === 'AbortError') {
       throw new ImageRequestValidationError('Image reference download timed out');
@@ -379,16 +382,21 @@ export function normalizeImageUsage(usage: any): UnifiedImageGenerationResponse[
 }
 
 export async function formatOpenRouterImageResponse(
-  response: UnifiedImageGenerationResponse
+  response: UnifiedImageGenerationResponse,
+  signal?: AbortSignal
 ): Promise<any> {
+  signal?.throwIfAborted();
   const data = await Promise.all(
     response.data.map(async (item) => {
       if (item.b64_json !== undefined || item.url === undefined) return item;
-      const resolved = await resolveImageReference({
-        type: 'image_url',
-        image_url: { url: item.url },
-        media_type: item.media_type,
-      });
+      const resolved = await resolveImageReference(
+        {
+          type: 'image_url',
+          image_url: { url: item.url },
+          media_type: item.media_type,
+        },
+        signal
+      );
       return {
         b64_json: resolved.data.toString('base64'),
         media_type: resolved.mimeType,
@@ -447,7 +455,8 @@ function appendFormValue(formData: FormData, key: string, value: unknown): void 
 }
 
 async function buildOpenAIReferenceRequest(
-  request: UnifiedImageGenerationRequest
+  request: UnifiedImageGenerationRequest,
+  signal?: AbortSignal
 ): Promise<FormData> {
   const references = request.input_references ?? [];
   if (references.length !== 1) {
@@ -457,7 +466,7 @@ async function buildOpenAIReferenceRequest(
   }
 
   const reference = references[0]!;
-  const parsed = await resolveImageReference(reference);
+  const parsed = await resolveImageReference(reference, signal);
 
   const formData = new FormData();
   appendFormValue(formData, 'model', request.model);
@@ -478,7 +487,7 @@ async function buildOpenAIReferenceRequest(
   );
 
   if (request.mask) {
-    const mask = await resolveImageReference(request.mask);
+    const mask = await resolveImageReference(request.mask, signal);
     formData.append(
       'mask',
       new Blob([new Uint8Array(mask.data)], { type: mask.mimeType }),
@@ -638,9 +647,12 @@ export class ImageTransformer {
     };
   }
 
-  async transformGenerationRequest(request: UnifiedImageGenerationRequest): Promise<any> {
+  async transformGenerationRequest(
+    request: UnifiedImageGenerationRequest,
+    signal?: AbortSignal
+  ): Promise<any> {
     if (request.input_references && request.input_references.length > 0) {
-      return buildOpenAIReferenceRequest(request);
+      return buildOpenAIReferenceRequest(request, signal);
     }
     return buildOpenAIGenerationRequest(request);
   }
