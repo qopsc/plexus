@@ -30,13 +30,13 @@
     },
     "mock-anthropic": {
       "type": "anthropic",
-      "api_base_url": "http://localhost:4010",
+      "api_base_url": { "messages": "http://localhost:4010" },
       "api_key": "sk-ant-mock-key",
       "disable_cooldown": true
     },
     "mock-gemini": {
       "type": "gemini",
-      "api_base_url": "http://localhost:4010",
+      "api_base_url": { "gemini": "http://localhost:4010" },
       "api_key": "mock-gemini-key",
       "disable_cooldown": true
     },
@@ -339,6 +339,26 @@
           "description": "OpenRouter auto-routing to best available model"
         }
       }
+    }
+  },
+
+  "mcpServers": {
+    "filesystem": {
+      "upstream_url": "http://localhost:4110/mcp",
+      "enabled": true,
+      "headers": {}
+    },
+    "github": {
+      "upstream_url": "http://localhost:4111/mcp",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer sk-mock-github-mcp-token"
+      }
+    },
+    "search-disabled": {
+      "upstream_url": "http://localhost:4112/mcp",
+      "enabled": false,
+      "headers": {}
     }
   },
 
