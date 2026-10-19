@@ -477,6 +477,13 @@
       "when": 1782276843904,
       "tag": "0067_sakana_quota_checker",
       "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1782403938013,
+      "tag": "0068_add_xai_cursor_provider_support",
+      "breakpoints": true
     }
   ]
 }
